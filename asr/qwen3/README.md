@@ -6,11 +6,9 @@ Offline C++ inference with TensorRT RTX and original BF16 weights.
 
 | Model | Hugging Face ID | Checkpoint | BF16 export | Recommended export |
 | --- | --- | --- | --- | --- |
-| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ⚠️ | BF16 |
-| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ⚠️ | BF16 |
-| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ⚠️ | BF16 |
-
-⚠️ tested tokens/spans match HF, but strict numerical comparisons differ.
+| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | BF16 |
+| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | BF16 |
+| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | BF16 |
 
 ## Supported capabilities
 
