@@ -474,17 +474,13 @@ const din::io::Audio& NormalizeAudio(const din::io::Audio& audio, din::io::Audio
 {
     if (audio.sample_rate != kRate || audio.samples.empty())
         throw std::runtime_error("Expected nonempty mono 16 kHz audio");
-    if (std::any_of(audio.samples.begin(), audio.samples.end(),
-                    [](float x)
-                    {
-                        return !std::isfinite(x);
-                    }))
-        throw std::runtime_error("Audio contains non-finite samples");
-    const float peak = std::abs(*std::max_element(audio.samples.begin(), audio.samples.end(),
-                                                  [](float a, float b)
-                                                  {
-                                                      return std::abs(a) < std::abs(b);
-                                                  }));
+    float peak = 0.f;
+    for (float sample : audio.samples)
+    {
+        if (!std::isfinite(sample))
+            throw std::runtime_error("Audio contains non-finite samples");
+        peak = std::max(peak, std::abs(sample));
+    }
     const auto* source = &audio;
     if (peak > 1.f)
     {
@@ -602,7 +598,7 @@ struct Qwen3Pipeline::Impl
         ONNXTensorElementDataType dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
         std::unique_ptr<din::io::Tokenizer> tokenizer;
         std::unique_ptr<OrtRunner> encoder, text, decode_alt;
-        int64_t hidden = 0, audio_id = 0;
+        int64_t hidden = 0, audio_id = 0, window = 0;
 
         struct EncoderBuffers
         {
@@ -639,7 +635,6 @@ struct Qwen3Pipeline::Impl
 
         EncodedAudio Encode(const std::vector<float>& features, int64_t frames)
         {
-            const int64_t window = metadata["audio_config"]["n_window_infer"];
             const int64_t tokens = AudioTokens(frames);
             EncodedAudio result{tokens, DeviceValue(*encoder, {tokens, hidden}, dtype)};
             Ort::RunOptions options;
@@ -681,6 +676,7 @@ struct Qwen3Pipeline::Impl
     Model asr;
     std::unique_ptr<Model> aligner;
     int64_t capacity = 0;
+    std::vector<int64_t> eos;
     std::array<std::vector<Ort::Value>, 2> cache;
     std::unique_ptr<TextInputs> step;
     // Retain one full block and the current tail per cache bank, with stable addresses.
@@ -704,6 +700,7 @@ struct Qwen3Pipeline::Impl
         if (!alignment_only)
         {
             LoadModel(asr, config.model_dir, "asr");
+            eos = asr.metadata["eos_token_ids"].get<std::vector<int64_t>>();
             if (!asr.native["prefixes"].contains(config.lang_id))
                 throw std::runtime_error("Unknown language hint");
         }
@@ -826,6 +823,7 @@ struct Qwen3Pipeline::Impl
             throw std::runtime_error("Re-export the aligner with --only aligner for GPU timestamp selection");
         if (meta["audio_config"]["num_mel_bins"] != 128 || meta["audio_config"]["n_window"] != 50)
             throw std::runtime_error("Unsupported audio geometry");
+        model.window = meta["audio_config"]["n_window_infer"];
         model.hidden = meta["text_config"]["hidden_size"];
         model.audio_id = meta["audio_token_id"];
         model.tokenizer = std::make_unique<din::io::Tokenizer>((dir / "processor/tokenizer.json").string(),
@@ -884,13 +882,13 @@ struct Qwen3Pipeline::Impl
         runner->session.Run(decode_options, *decode_bindings[bank]);
     }
 
-    std::vector<float> Features(const din::io::Audio& audio)
+    std::vector<float> Features(std::span<const float> audio)
     {
         din::common::nvtx_scoped_range range{"qwen3.mel"};
-        const int64_t samples = std::max<int64_t>(8000, audio.samples.size());
+        const int64_t samples = std::max<int64_t>(8000, audio.size());
         Buffer<float> input(*mel, {1, samples}, true), output(*mel, {1, 128, samples / 160}, true);
         input.Fill(0.f);
-        std::copy(audio.samples.begin(), audio.samples.end(), input.HostData());
+        std::copy(audio.begin(), audio.end(), input.HostData());
         input.CopyAsyncToDevice();
         Ort::IoBinding binding(mel->session);
         binding.BindInput("samples", input.BindingValue());
@@ -955,22 +953,23 @@ struct Qwen3Pipeline::Impl
             output.CopyAsyncToHostWithNotification().Sync();
         }
         din::common::nvtx_scoped_range postprocess{"qwen3.align_postprocess"};
+        const float timestamp_scale = model.metadata["timestamp_segment_time"];
         std::vector<int> raw;
         for (size_t i = 0; i < slots.size(); ++i)
         {
             const auto best = output.HostData()[i];
             if (best < 0 || best >= labels)
                 throw std::runtime_error("Invalid timestamp bin");
-            raw.push_back(static_cast<int>(best * model.metadata["timestamp_segment_time"].get<float>()));
+            raw.push_back(static_cast<int>(best * timestamp_scale));
         }
         const auto times = detail::FixTimestamps(raw);
         for (size_t i = 0; i < words.size(); ++i)
             result.timestamps.push_back({words[i], times[2 * i] / 1000.f, times[2 * i + 1] / 1000.f});
     }
 
-    TranscriptionResult TranscribeChunk(const din::io::Audio& audio)
+    TranscriptionResult TranscribeChunk(std::span<const float> audio)
     {
-        if (audio.sample_rate != kRate || audio.samples.empty() || audio.samples.size() > kMaxSamples)
+        if (audio.empty() || audio.size() > kMaxSamples)
             throw std::runtime_error("Expected nonempty mono 16 kHz audio, at most 1205 seconds per chunk");
         auto features = Features(audio);
         const int64_t frames = features.size() / 128;
@@ -1017,7 +1016,6 @@ struct Qwen3Pipeline::Impl
         }
         int64_t position = ids.size();
         TranscriptionResult result;
-        const auto eos = asr.metadata["eos_token_ids"].get<std::vector<int64_t>>();
         for (int count = 0; count < config.max_new_tokens; ++count)
         {
             din::common::nvtx_scoped_range range{"qwen3.decode_step"};
@@ -1057,7 +1055,7 @@ struct Qwen3Pipeline::Impl
         const auto& source = NormalizeAudio(audio, normalized);
         if (config.progress)
             config.progress({din::common::ProgressStage::Transcribing, "Aligning supplied text", 0, audio.Duration()});
-        const auto features = Features(source);
+        const auto features = Features(source.samples);
         TranscriptionResult result;
         result.text = text;
         result.language = language;
@@ -1081,8 +1079,7 @@ struct Qwen3Pipeline::Impl
         std::string previous_language;
         for (const auto chunk : detail::SplitAudio(source->samples, config.max_chunk_seconds))
         {
-            din::io::Audio input{{source->samples.begin() + chunk.begin, source->samples.begin() + chunk.end}, kRate};
-            auto part = TranscribeChunk(input);
+            auto part = TranscribeChunk(std::span(source->samples).subspan(chunk.begin, chunk.end - chunk.begin));
             result.text += part.text;  // Upstream joins literally, without overlap or inserted separators.
             Append(result.tokens, part.tokens);
             if (!part.language.empty() && part.language != previous_language)
