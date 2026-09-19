@@ -17,6 +17,7 @@ enum class TokenizerFormat
     Json,
     Vocab,
     WhisperJson,
+    ByteBpeJson,  // Qwen byte-level decoding and ASCII encoding; existing formats are unchanged.
 };
 
 inline constexpr int64_t kWhisperEndOfText = 50257;
@@ -48,6 +49,7 @@ private:
     enum class DecodeMode
     {
         Pieces,
+        ByteBpe,
         WhisperByteBpe,
     };
 

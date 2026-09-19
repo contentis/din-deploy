@@ -347,6 +347,7 @@ Tokenizer::Tokenizer(const std::string& path, TokenizerFormat format)
     switch (format)
     {
     case TokenizerFormat::Json:
+    case TokenizerFormat::ByteBpeJson:
     {
         auto tokenizer_data = LoadJsonTokenizerData(path);
         id_to_token_ = std::move(tokenizer_data.id_to_token);
@@ -354,7 +355,7 @@ Tokenizer::Tokenizer(const std::string& path, TokenizerFormat format)
         bpe_ranks_ = std::move(tokenizer_data.bpe_ranks);
         special_tokens_ = std::move(tokenizer_data.special_tokens);
         byte_encoder_ = BuildByteEncoder();
-        decode_mode_ = DecodeMode::Pieces;
+        decode_mode_ = format == TokenizerFormat::ByteBpeJson ? DecodeMode::ByteBpe : DecodeMode::Pieces;
         break;
     }
     case TokenizerFormat::Vocab:
@@ -434,7 +435,7 @@ bool IsContractionAt(std::string_view text, size_t pos, size_t* length)
     return false;
 }
 
-std::vector<std::string> SplitForByteLevelBpe(std::string_view text)
+std::vector<std::string> SplitForByteLevelBpe(std::string_view text, bool qwen = false)
 {
     std::vector<std::string> pieces;
     size_t pos = 0;
@@ -449,6 +450,15 @@ std::vector<std::string> SplitForByteLevelBpe(std::string_view text)
         }
 
         const auto current = static_cast<uint8_t>(text[pos]);
+        // Qwen's letter branch permits one non-letter/digit prefix (not just a space).
+        if (qwen && current != '\r' && current != '\n' && !IsAsciiLetter(current) && !IsAsciiDigit(current) &&
+            pos + 1 < text.size() && IsAsciiLetter(static_cast<uint8_t>(text[pos + 1])))
+        {
+            const auto start = pos++;
+            while (pos < text.size() && IsAsciiLetter(static_cast<uint8_t>(text[pos]))) ++pos;
+            pieces.emplace_back(text.substr(start, pos - start));
+            continue;
+        }
         if (current == ' ' && pos + 1 < text.size() &&
             (IsAsciiLetter(static_cast<uint8_t>(text[pos + 1])) || IsAsciiDigit(static_cast<uint8_t>(text[pos + 1])) ||
              !IsAsciiWhitespace(static_cast<uint8_t>(text[pos + 1]))))
@@ -604,7 +614,7 @@ std::vector<int64_t> Tokenizer::Encode(const std::string& text, bool add_special
     std::vector<int64_t> ids;
     const auto encode_segment = [&](std::string_view segment)
     {
-        for (const auto& piece : SplitForByteLevelBpe(segment))
+        for (const auto& piece : SplitForByteLevelBpe(segment, decode_mode_ == DecodeMode::ByteBpe))
         {
             for (const auto& token : ApplyByteLevelBpe(piece, byte_encoder_, bpe_ranks_))
             {
@@ -667,6 +677,25 @@ std::string Tokenizer::CleanToken(int64_t id) const
 
 std::string Tokenizer::Decode(const std::vector<int64_t>& ids, bool skip_special_tokens, bool strip_lang_tags) const
 {
+    if (decode_mode_ == DecodeMode::ByteBpe)
+    {
+        const auto byte_decoder = BuildByteDecoder();
+        std::string text;
+        for (auto id : ids)
+        {
+            const auto& token = Token(id);
+            if (skip_special_tokens &&
+                std::find(special_tokens_.begin(), special_tokens_.end(), token) != special_tokens_.end()) continue;
+            for (size_t i = 0; i < token.size();)
+            {
+                const auto code = NextCodePoint(token, i);
+                const auto byte = byte_decoder.find(code);
+                if (byte == byte_decoder.end()) throw std::runtime_error("Invalid byte-level vocabulary entry");
+                text.push_back(static_cast<char>(byte->second));
+            }
+        }
+        return text;
+    }
     if (decode_mode_ == DecodeMode::WhisperByteBpe)
     {
         std::string text;

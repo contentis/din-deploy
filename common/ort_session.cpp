@@ -564,7 +564,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     const auto output_model_path = CompiledModelPath(model_path, ep_context, profile);
     if (fs::exists(output_model_path))
     {
-        if (IsCompatibleEpContext(env, output_model_path))
+        if (fs::last_write_time(output_model_path) >= fs::last_write_time(model_path) &&
+            IsCompatibleEpContext(env, output_model_path))
         {
             return output_model_path;
         }
@@ -595,6 +596,8 @@ std::string CompileEpContextModel(Ort::Env& env, const std::string& model_path, 
     const size_t size_threshold_external_init = 1024;
     compile_options.SetOutputModelExternalInitializersFile(output_external_wide.c_str(), size_threshold_external_init);
 
+    if (ep_context.progress)
+        ep_context.progress({ProgressStage::CompilingModel, fs::path(model_path).filename().string()});
     const Ort::Status status = Ort::CompileModel(env, compile_options);
     if (!status.IsOK())
     {
@@ -788,6 +791,8 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
 {
     DIN_NVTX_FUNC_RANGE();
     auto session_model_path = model_path;
+    if (ep_context.progress)
+        ep_context.progress({ProgressStage::LoadingModel, fs::path(model_path).filename().string()});
 
     if (provider == "trt-rtx")
     {
@@ -825,6 +830,8 @@ OrtRunner::OrtRunner(Ort::Env& env_in, const std::string& model_path, const std:
         throw std::runtime_error("unsupported provider: " + provider);
     }
 
+    if (ep_context.progress)
+        ep_context.progress({ProgressStage::LoadingModel, fs::path(session_model_path).filename().string()});
 #ifdef _WIN32
     const auto wide = ToOrtPathString(session_model_path);
     {
