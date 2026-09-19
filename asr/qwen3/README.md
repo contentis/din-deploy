@@ -67,6 +67,9 @@ auto spans = aligner.AlignFile("recording.wav", "Supplied transcript", "English"
 ```
 
 Reuse pipeline/aligner instances; calls on one instance are synchronous.
+Set `Qwen3Config::progress` for audio loading, model loading/compilation, ASR chunk
+completion and standalone alignment start/completion. Callbacks run on the calling
+thread; inference progress is stage/chunk-based, not a token-level percentage.
 Standalone alignment accepts segments up to 180 seconds; longer recordings need
 matching audio/text segments. ASR splits long audio using upstream's quiet-boundary
 algorithm: 1200-second targets, or 180 with alignment, and a ±5-second search.

@@ -14,6 +14,8 @@ DIN Deploy is distributed under the Apache License, Version 2.0. The project sou
 | Slang | Apache-2.0 with LLVM exception: <https://github.com/shader-slang/slang/blob/master/LICENSE> |
 | Vulkan-Headers and Vulkan-Loader | Apache-2.0: <https://github.com/KhronosGroup/Vulkan-Headers/blob/main/LICENSE.txt> and <https://github.com/KhronosGroup/Vulkan-Loader/blob/main/LICENSE.txt> |
 | nanobind | BSD-3-Clause: <https://github.com/wjakob/nanobind/blob/main/LICENSE> |
+| Qwen3-ASR inference utilities | Apache-2.0, copyright 2026 The Alibaba Qwen team: <https://github.com/QwenLM/Qwen3-ASR/blob/main/LICENSE> |
+| Transformers Qwen3-ASR processing | Apache-2.0, copyright Hugging Face: <https://github.com/huggingface/transformers/blob/v5.13.0/LICENSE> |
 | Python dependencies | See the package license links and inventory below. |
 | Distributed models and model artifacts | See the model license inventory below. Model terms may differ from this project's license. |
 
@@ -74,10 +76,6 @@ For components supplied through an SDK or binary package, the corresponding vend
 
 ## Model/Artifact
 
-- Qwen3-ASR-0.6B-hf, Qwen3-ASR-1.7B-hf and Qwen3-ForcedAligner-0.6B-hf: Apache-2.0. Checkpoints are downloaded separately from [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) and [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf). The draft export adapters follow the architectures in Hugging Face Transformers (Apache-2.0).
-  Native alignment word cleanup and timestamp repair follow [Transformers Qwen3-ASR processing](https://github.com/huggingface/transformers/blob/v5.13.0/src/transformers/models/qwen3_asr/processing_qwen3_asr.py) (Apache-2.0, copyright Hugging Face).
-  Native long-form splitting, output parsing and repetition cleanup follow [Qwen3-ASR inference utilities](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/utils.py) (Apache-2.0, copyright 2026 The Alibaba Qwen team).
-
 - `black-forest-labs/FLUX.2-klein-4b`: Apache-2.0
 - `black-forest-labs/FLUX.2-klein-4b-fp8`: Apache-2.0
 - `black-forest-labs/FLUX.2-klein-4b-nvfp4`: Apache-2.0
@@ -94,3 +92,7 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `openai/whisper-large-v3-turbo`: Apache-2.0
 - `openai/whisper-medium`: Apache-2.0
 - `openai/whisper-small`: Apache-2.0
+
+- `Qwen/Qwen3-ASR-0.6B-hf`: Apache-2.0
+- `Qwen/Qwen3-ASR-1.7B-hf`: Apache-2.0
+- `Qwen/Qwen3-ForcedAligner-0.6B-hf`: Apache-2.0

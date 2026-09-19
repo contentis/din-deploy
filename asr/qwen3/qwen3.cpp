@@ -946,11 +946,17 @@ struct Qwen3Pipeline::Impl
         if (audio.samples.size() > 180 * kRate)
             throw std::invalid_argument("Standalone alignment accepts up to 180 seconds; supply audio/text segments");
         din::io::Audio normalized;
-        const auto features = Features(NormalizeAudio(audio, normalized));
+        const auto& source = NormalizeAudio(audio, normalized);
+        if (config.progress)
+            config.progress({din::common::ProgressStage::Transcribing, "Aligning supplied text", 0, audio.Duration()});
+        const auto features = Features(source);
         TranscriptionResult result;
         result.text = text;
         result.language = language;
         Align(result, features, features.size() / 128);
+        if (config.progress)
+            config.progress(
+                {din::common::ProgressStage::Transcribing, "Alignment complete", audio.Duration(), audio.Duration()});
         return result.timestamps;
     }
 
@@ -960,6 +966,8 @@ struct Qwen3Pipeline::Impl
         const auto start = std::chrono::steady_clock::now();
         din::io::Audio normalized;
         const auto* source = &NormalizeAudio(audio, normalized);
+        if (config.progress)
+            config.progress({din::common::ProgressStage::Transcribing, "Transcribing", 0, audio.Duration()});
         TranscriptionResult result;
         result.reached_eos = true;
         std::string previous_language;
@@ -986,9 +994,11 @@ struct Qwen3Pipeline::Impl
             ++result.chunks_processed;
             result.reached_eos = result.reached_eos && part.reached_eos;
             if (config.progress)
-                config.progress({din::common::ProgressStage::Transcribing,
-                                 "Completed chunk " + std::to_string(result.chunks_processed),
-                                 double(chunk.end) / kRate, audio.Duration()});
+                config.progress(
+                    {din::common::ProgressStage::Transcribing,
+                     "Completed chunk " + std::to_string(result.chunks_processed),
+                     chunk.end == source->samples.size() ? audio.Duration() : static_cast<float>(chunk.end) / kRate,
+                     audio.Duration()});
         }
         result.audio_seconds = static_cast<float>(audio.samples.size()) / kRate;
         result.transcribe_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();
@@ -1007,6 +1017,8 @@ TranscriptionResult Qwen3Pipeline::Transcribe(const din::io::Audio& audio)
 }
 TranscriptionResult Qwen3Pipeline::TranscribeFile(const std::filesystem::path& path)
 {
+    if (impl_->config.progress)
+        impl_->config.progress({din::common::ProgressStage::DecodingAudio, path.filename().string()});
     return Transcribe(din::io::LoadAudio(path.string(), kRate));
 }
 Qwen3ForcedAligner::Qwen3ForcedAligner(Qwen3Config config)
@@ -1024,6 +1036,8 @@ std::vector<WordTimestamp> Qwen3ForcedAligner::Align(const din::io::Audio& audio
 std::vector<WordTimestamp> Qwen3ForcedAligner::AlignFile(const std::filesystem::path& path, const std::string& text,
                                                          const std::string& language)
 {
+    if (impl_->config.progress)
+        impl_->config.progress({din::common::ProgressStage::DecodingAudio, path.filename().string()});
     return Align(din::io::LoadAudio(path.string(), kRate), text, language);
 }
 }  // namespace din::asr::qwen3
