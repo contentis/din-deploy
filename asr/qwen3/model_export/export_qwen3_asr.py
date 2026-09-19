@@ -23,6 +23,90 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
 from common.model_export.log_mel import LogMel as WhisperMel  # noqa: E402
 
 
+class FP8Linear(nn.Module):
+    def __init__(self, linear, activation_amax):
+        super().__init__()
+        scale = (linear.weight.detach().float().abs().amax() / 448).clamp_min(1e-8).to(torch.bfloat16)
+        self.register_buffer("weight_scale", scale)
+        self.register_buffer("input_scale", torch.tensor(max(activation_amax / 448, 1e-8), dtype=torch.bfloat16))
+        self.register_buffer(
+            "weight", (linear.weight.detach().float() / scale.float()).clamp(-448, 448).to(torch.float8_e4m3fn)
+        )
+        self.register_buffer("bias", linear.bias)
+
+    def forward(self, x):
+        if torch.onnx.is_in_onnx_export():
+            x = torch.onnx.ops.symbolic(
+                "QuantizeLinear",
+                (x, self.input_scale),
+                {"output_dtype": onnx.TensorProto.FLOAT8E4M3FN},
+                dtype=torch.float8_e4m3fn,
+                shape=x.shape,
+                version=23,
+            )
+            x = torch.onnx.ops.symbolic(
+                "DequantizeLinear",
+                (x, self.input_scale),
+                dtype=torch.bfloat16,
+                shape=x.shape,
+                version=23,
+            )
+            weight = torch.onnx.ops.symbolic(
+                "DequantizeLinear",
+                (self.weight, self.weight_scale),
+                dtype=torch.bfloat16,
+                shape=self.weight.shape,
+                version=23,
+            )
+        else:
+            x = (x.float() / self.input_scale.float()).clamp(-448, 448).to(torch.float8_e4m3fn)
+            x = (x.float() * self.input_scale.float()).to(torch.bfloat16)
+            weight = (self.weight.float() * self.weight_scale.float()).to(torch.bfloat16)
+        return F.linear(x, weight, self.bias)
+
+
+@torch.inference_mode()
+def calibrate_fp8(model, processor, audio):
+    maxima, hooks = {}, []
+
+    def observe(name):
+        def collect(module, inputs):
+            maximum = inputs[0].float().abs().amax()
+            maxima[name] = torch.maximum(maxima.get(name, maximum), maximum)
+
+        return collect
+
+    for name, module in model.model.language_model.named_modules():
+        if isinstance(module, nn.Linear):
+            hooks.append(module.register_forward_pre_hook(observe(name)))
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    try:
+        model.to(device)
+        for path in audio:
+            print(f"Calibrating FP8: {path}", flush=True)
+            inputs = processor.apply_transcription_request(audio=str(path), return_tensors="pt")
+            inputs = {
+                k: v.to(device=device, dtype=model.dtype if v.is_floating_point() else v.dtype)
+                for k, v in inputs.items()
+            }
+            model.generate(**inputs, do_sample=False, max_new_tokens=128)
+        return {name: value.item() for name, value in maxima.items()}
+    finally:
+        for hook in hooks:
+            hook.remove()
+        model.cpu()
+
+
+def apply_fp8(model, maxima):
+    modules = {
+        name: module for name, module in model.model.language_model.named_modules() if isinstance(module, nn.Linear)
+    }
+    if set(modules) != set(maxima) or any(not 0 <= value < float("inf") for value in maxima.values()):
+        raise ValueError("FP8 calibration must contain finite maxima for every decoder projection")
+    for name, module in modules.items():
+        model.model.language_model.set_submodule(name, FP8Linear(module, maxima[name]))
+
+
 class LogMel(WhisperMel):
     def __init__(self, processor):
         fe = processor.feature_extractor
@@ -291,6 +375,12 @@ def main():
     parser.add_argument("--output", type=Path, help="Defaults to the ONNX artifact directory for --task")
     parser.add_argument("--task", choices=["asr", "aligner"], default="asr")
     parser.add_argument("--dtype", choices=["original", "fp16", "fp32"], default="original")
+    parser.add_argument(
+        "--quantization", choices=["fp8"], help="ASR decoder W8A8; keeps encoder, attention and KV in BF16"
+    )
+    parser.add_argument(
+        "--calibration-audio", type=Path, nargs="+", help="Representative audio for FP8 activation calibration"
+    )
     parser.add_argument("--only", choices=["mel", "encoder", "decoder", "decode", "aligner"])
     parser.add_argument(
         "--decode-capacities",
@@ -305,9 +395,17 @@ def main():
     args.model = args.model or (
         "Qwen/Qwen3-ForcedAligner-0.6B-hf" if args.task == "aligner" else f"Qwen/Qwen3-ASR-{args.size}-hf"
     )
-    precision = "bf16" if args.dtype == "original" else args.dtype
+    precision = args.quantization or ("bf16" if args.dtype == "original" else args.dtype)
     size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in args.model.lower() else ""
     args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}{size_suffix}")
+    if args.quantization and (args.task != "asr" or args.dtype != "original" or args.only not in (None, "decode")):
+        parser.error("FP8 requires ASR with --dtype original and a full export or --only decode")
+    if args.quantization and args.only != "decode" and not args.calibration_audio:
+        parser.error("FP8 requires --calibration-audio")
+    if args.calibration_audio and (not args.quantization or args.only == "decode"):
+        parser.error("--calibration-audio requires a full FP8 export; --only decode reuses saved scales")
+    if args.calibration_audio and any(not path.is_file() for path in args.calibration_audio):
+        parser.error("Every calibration audio path must be an existing file")
     if args.threads < 1:
         parser.error("threads must be positive")
     if args.cache_capacity < 4:
@@ -326,6 +424,8 @@ def main():
         requested = {"original": "bfloat16", "fp16": "float16", "fp32": "float32"}[args.dtype]
         if existing["dtype"] != requested:
             parser.error("Partial export must keep the existing precision; use a separate output directory")
+        if existing.get("quantization", {}).get("type") != args.quantization:
+            parser.error("Partial export must keep the existing quantization")
     torch.set_num_threads(args.threads)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.only == "decoder" and args.task != "asr" or args.only == "aligner" and args.task != "aligner":
@@ -358,8 +458,14 @@ def main():
         raise ValueError("This export contract requires n_window=50 and 128 mel bins")
     if cfg.text_config.rope_parameters["rope_type"] != "default":
         raise ValueError("Only default RoPE is supported by this draft")
+    quantization = None
+    if args.quantization:
+        if args.only == "decode":
+            quantization = existing["quantization"]
+        else:
+            quantization = {"type": "fp8", "activation_amax": calibrate_fp8(model, processor, args.calibration_audio)}
+        apply_fp8(model, quantization["activation_amax"])
     if args.only == "decode":
-
         metadata = json.loads((args.output / "metadata.json").read_text(encoding="utf-8"))
         if (
             metadata["task"] != "asr"
@@ -448,7 +554,6 @@ def main():
                 },
             )
     if args.decode_capacities:
-
         with torch.inference_mode():
             export_decode(TextDecoder(model), cfg.text_config, dtype, args.output, args.decode_capacities)
     eos = cfg.eos_token_id
@@ -475,6 +580,8 @@ def main():
             timestamp_segment_time=processor.timestamp_segment_time,
         )
     metadata["source"] = {"model": args.model, "revision": revision}
+    if quantization:
+        metadata["quantization"] = quantization
     if args.decode_capacities:
         metadata["decode_capacities"] = sorted(set(args.decode_capacities))
     if args.only == "encoder" and (args.output / "metadata.json").exists():

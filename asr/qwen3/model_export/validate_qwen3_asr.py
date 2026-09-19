@@ -331,6 +331,7 @@ def validate(args):
         "atol": args.atol,
         "provider": runner.provider,
         "dtype": str(runner.dtype),
+        "quantization": runner.metadata.get("quantization", {}).get("type"),
         "source": runner.metadata["source"],
         "cases": reports,
     }

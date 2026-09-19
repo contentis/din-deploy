@@ -1,14 +1,14 @@
 # Qwen3 ASR and forced alignment
 
-Offline C++ inference with TensorRT RTX in BF16 (default), FP16 or FP32.
+Offline C++ inference with TensorRT RTX in BF16 (default), FP16 or FP32, with optional FP8 decoder quantization.
 
 ## Supported models
 
-| Model | Hugging Face ID | Checkpoint | BF16 export | FP16 export | FP32 export | Recommended export |
-| --- | --- | --- | --- | --- | --- | --- |
-| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
-| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
-| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
+| Model | Hugging Face ID | Checkpoint | BF16 export | FP16 export | FP32 export | FP8 decoder | Recommended export |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | ✓ | BF16 |
+| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | ✓ | ✓ | ✓ | BF16 |
+| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | — | BF16 |
 
 ## Supported capabilities
 
@@ -51,6 +51,17 @@ python -X utf8 export_qwen3_asr.py --dtype fp16 --output D:/models/qwen3-asr-0.6
 python -X utf8 export_qwen3_asr.py --dtype fp32 --output D:/models/qwen3-asr-0.6b-onnx-fp32
 ```
 
+For FP8 W8A8 decoder projections, supply representative calibration audio:
+
+```bash
+python -X utf8 export_qwen3_asr.py --quantization fp8 --calibration-audio speech-en.wav speech-zh.wav --decode-capacities 256 512 1024 2048 4096 8192 --output D:/models/qwen3-asr-0.6b-onnx-fp8
+```
+
+Add `--size 1.7B` for the larger model. HF generation calibrates activation scales;
+the encoder, output head, attention and KV cache stay BF16. FP8 needs a compatible
+GPU and can change transcription. `--only decode --quantization fp8` reuses saved
+calibration scales when adding cache buckets.
+
 The C++ pipeline reads precision from each export; ASR and aligner can use different
 precisions. FP32 uses decomposed attention for TensorRT RTX compatibility; BF16/FP16
 use fused attention. Log-mel stays FP32. Use separate output directories per precision.
@@ -77,6 +88,8 @@ then uses HF `generate()` for a short end-to-end token/EOS check. Alignment uses
 HF transcript preparation and span decoding. Strict BF16 numerical comparisons
 can fail despite matching tokens/spans. Long-form specialized decoding can change
 words; long-form alignment has small endpoint differences from HF.
+FP8 is compared against the original BF16 HF model; quantization differences remain
+visible in the report rather than being treated as a numerical pass.
 
 ## Build
 
