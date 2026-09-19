@@ -2,20 +2,14 @@
 """Validate Qwen3 ASR or forced alignment against HF in checkpoint precision."""
 
 import argparse
-import hashlib
 import json
-import time
-from dataclasses import dataclass
-from math import gcd
 from pathlib import Path
+from unittest.mock import patch
 
-import numpy as np
 import onnxruntime as ort
-import soundfile as sf
-from scipy.signal import resample_poly
 import torch
 from transformers import AutoProcessor, Qwen3ASRForConditionalGeneration, Qwen3ASRForTokenClassification
-
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 _REGISTERED_EP = None
 
@@ -40,72 +34,51 @@ def session_options(provider, threads, extra_options=None):
     return options, None
 
 
-def ort_numpy(value):
-    """Promote only diagnostic/host output, since NumPy has no native BF16 type."""
-    return torch.from_dlpack(value).float().cpu().numpy()
-
-
-def load_audio(path):
-    audio, rate = sf.read(path, dtype="float32", always_2d=True)
-    audio = audio.mean(axis=1)
-    if rate != 16000:
-        factor = gcd(rate, 16000)
-        audio = resample_poly(audio, 16000 // factor, rate // factor).astype(np.float32)
-    if not audio.size:
-        raise ValueError("Audio is empty")
-    return audio
-
-
 def pack_audio(features, mask, config):
-    """Reproduce the native encoder's packing without tracing nonzero/list splits."""
     chunk_size = config["n_window"] * 2
     if features.shape[0] != 1 or features.shape[-1] % chunk_size:
         raise ValueError("Expected batch-one features padded to the encoder chunk size")
-    chunks = features.reshape(1, features.shape[1], -1, chunk_size)[0].transpose(1, 0, 2).copy()
-    lengths = mask.reshape(-1, chunk_size).sum(axis=1).astype(np.int64)
+    chunks = features.reshape(1, features.shape[1], -1, chunk_size)[0].permute(1, 0, 2)
+    lengths = mask.reshape(-1, chunk_size).sum(1)
     for _ in range(3):
         lengths = (lengths + 1) // 2
-    max_length = (chunk_size + 7) // 8
-    indices = np.flatnonzero((np.arange(max_length)[None] < lengths[:, None]).reshape(-1)).astype(np.int64)
+    indices = (torch.arange((chunk_size + 7) // 8)[None] < lengths[:, None]).flatten().nonzero().flatten()
     if not len(indices):
         raise ValueError("Audio has no valid feature frames")
     window = int(lengths.max()) * (config["n_window_infer"] // chunk_size)
-    groups = np.arange(len(indices)) // window
-    bias = np.where(groups[:, None] == groups[None], 0.0, np.finfo(np.float32).min)
-    return chunks, indices, bias[None, None].astype(np.float32)
+    groups = torch.arange(len(indices)) // window
+    bias = torch.zeros(len(indices), len(indices)).masked_fill(groups[:, None] != groups[None], -1e4)
+    return chunks, indices, bias[None, None]
 
 
 def decoder_inputs(ids, embeddings, audio_token_id, hidden_size, past_length, capacity=None):
-    ids = np.asarray(ids, dtype=np.int64).reshape(1, -1)
+    ids = ids.cpu().long().reshape(1, -1)
     seq = ids.shape[1]
     if not seq or past_length < 0 or (capacity is not None and past_length + seq > capacity):
         raise ValueError("Input exceeds KV cache capacity or has invalid length")
-    mask = (ids == audio_token_id)[..., None] if embeddings is not None else np.zeros((1, seq, 1), dtype=bool)
-    padded = np.zeros((1, seq, hidden_size), dtype=np.float32)
+    mask = (ids == audio_token_id)[..., None] if embeddings is not None else torch.zeros(1, seq, 1, dtype=torch.bool)
+    padded = torch.zeros(1, seq, hidden_size)
     if embeddings is not None:
         if int(mask.sum()) != len(embeddings):
             raise ValueError("Audio placeholder count differs from encoder output length")
-        padded[mask[..., 0]] = embeddings
-    positions = np.arange(past_length, past_length + seq, dtype=np.int64)[None]
-    allowed = np.arange(capacity or past_length + seq)[None, :] <= positions.T
-    # Same finite mask as Whisper, avoiding NaNs in fully masked flash tiles.
-    bias = np.where(allowed, 0.0, -1e4).astype(np.float32)[None, None]
+        padded[mask[..., 0]] = embeddings.float().cpu()
+    positions = torch.arange(past_length, past_length + seq)[None]
+    allowed = torch.arange(capacity or past_length + seq)[None] <= positions.T
     return {
         "input_ids": ids,
         "audio_embeddings": padded,
         "audio_mask": mask,
         "position_ids": positions,
-        "attention_bias": bias,
+        "attention_bias": torch.zeros_like(allowed, dtype=torch.float32).masked_fill(~allowed, -1e4)[None, None],
     }
 
 
 class OnnxAudioModel:
-    def __init__(self, directory, threads=4, provider=None):
+    def __init__(self, directory, task, threads=4, provider=None):
+        self.text_graph = "decoder.onnx" if task == "asr" else "aligner.onnx"
         directory = Path(directory)
         self.directory = directory
         self.threads = threads
-        self.decode_session = None
-        self.decode_capacity = 0
         self.metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         self.processor = AutoProcessor.from_pretrained(directory / "processor", local_files_only=True)
         self.dtype = getattr(torch, self.metadata["dtype"])
@@ -143,316 +116,228 @@ class OnnxAudioModel:
             )
         self.decoder = ort.InferenceSession(str(directory / self.text_graph), options, providers=providers)
 
-    def run(self, session, feed):
+    def session(self, name):
+        options, providers = session_options(self.provider, self.threads)
+        return ort.InferenceSession(str(self.directory / name), options, providers=providers)
+
+    def run(self, session, feed, inplace=False):
         values = {}
-        for name, value in feed.items():
-            if isinstance(value, ort.OrtValue):
-                values[name] = value
-                continue
-            if not np.issubdtype(value.dtype, np.floating):
-                values[name] = ort.OrtValue.ortvalue_from_numpy(np.ascontiguousarray(value))
-                continue
-            tensor = torch.from_numpy(np.ascontiguousarray(value))
+        for name, tensor in feed.items():
+            tensor = tensor.detach().to("cuda" if inplace else "cpu").contiguous()
             if tensor.is_floating_point():
-                if name == "attention_bias":
-                    tensor = tensor.clamp(min=torch.finfo(self.dtype).min)
                 tensor = tensor.to(self.dtype)
-            values[name] = ort.OrtValue.from_dlpack(tensor)
-        # OrtValues preserve BF16 outputs/caches without a NumPy FP32 round trip.
-        return session.run_with_ort_values(None, values)
+            # DLPack preserves BF16; ORT expects boolean capsules encoded as uint8.
+            if tensor.dtype == torch.bool:
+                capsule = torch.utils.dlpack.to_dlpack(tensor.view(torch.uint8))
+                values[name] = ort.OrtValue(ort.capi._pybind_state.OrtValue.from_dlpack(capsule, True))
+            else:
+                values[name] = ort.OrtValue.from_dlpack(tensor)
+        if inplace:
+            # TensorRT requires TensorScatter past/present to alias, even for validation.
+            binding = session.io_binding()
+            for name, value in values.items():
+                binding.bind_ortvalue_input(name, value)
+            for output in session.get_outputs():
+                if output.name.startswith("present_"):
+                    binding.bind_ortvalue_output(output.name, values[output.name.replace("present_", "past_")])
+                else:
+                    binding.bind_output(output.name)
+            torch.cuda.synchronize()
+            session.run_with_iobinding(binding)
+            binding.synchronize_outputs()
+            outputs = binding.get_outputs()
+        else:
+            outputs = session.run_with_ort_values(None, values)
+        return [torch.from_dlpack(value).cpu().clone() for value in outputs]
 
     def encode(self, inputs):
-        packed = pack_audio(
-            inputs["input_features"].numpy(), inputs["input_features_mask"].numpy(), self.metadata["audio_config"]
-        )
-        return ort_numpy(
-            self.run(self.encoder, dict(zip(("mel_chunks", "valid_indices", "attention_bias"), packed, strict=True)))[0]
-        )
+        packed = pack_audio(inputs["input_features"], inputs["input_features_mask"], self.metadata["audio_config"])
+        return self.run(
+            self.encoder, dict(zip(("mel_chunks", "valid_indices", "attention_bias"), packed, strict=True))
+        )[0]
 
-
-@dataclass
-class DecodeCache:
-    values: list
-    spare: list
-    capacity: int
-    length: int = 0
-
-
-class OnnxASR(OnnxAudioModel):
-    text_graph = "decoder.onnx"
-
-    def empty_cache(self, required=None):
+    def empty_cache(self, capacity):
         c = self.metadata["text_config"]
-        device = "cuda" if self.provider == "trt-rtx" else "cpu"
-        if self.metadata.get("format_version") != 2:
-            raise ValueError("Re-export the model for the fixed-capacity cache contract (format 2)")
-        capacity = self.metadata["cache_capacity"]
-        if required is not None and self.metadata.get("dynamic_cache_capacity"):
-            capacity = min(capacity, max(4, 1 << (required - 1).bit_length()))
-        values = [
-            ort.OrtValue.from_dlpack(
-                torch.zeros(
-                    (1, c["num_key_value_heads"], capacity, c["head_dim"]),
-                    dtype=self.dtype,
-                    device=device,
-                )
-            )
-            for _ in range(4 * c["num_hidden_layers"])
+        return [
+            torch.zeros(1, c["num_key_value_heads"], capacity, c["head_dim"], dtype=self.dtype)
+            for _ in range(2 * c["num_hidden_layers"])
         ]
-        if device == "cuda":
-            torch.cuda.synchronize()
-        count = 2 * c["num_hidden_layers"]
-        return DecodeCache(values[:count], values[count:], capacity)
 
-    def step(self, ids, embeddings, cache):
+    def step(self, ids, embeddings, cache, length, session=None):
         feed = decoder_inputs(
             ids,
             embeddings,
             self.metadata["audio_token_id"],
             self.metadata["text_config"]["hidden_size"],
-            cache.length,
-            cache.capacity,
+            length,
+            cache[0].shape[2],
         )
-        device = "cuda" if self.provider == "trt-rtx" else "cpu"
-        inplace = (
-            device == "cuda"
-            and cache.length > 0
-            and feed["input_ids"].shape[1] == 1
-            and cache.capacity in self.metadata.get("decode_capacities", [])
+        feed.update({f"past_{i}": value for i, value in enumerate(cache)})
+        logits, _, *present = self.run(
+            session or self.decoder,
+            feed,
+            inplace=session is not None and session is not self.decoder and self.provider == "trt-rtx",
         )
-        session = self.decoder
-        if inplace:
-            if self.decode_capacity != cache.capacity:
-                options, providers = session_options(self.provider, self.threads)
-                path = self.directory / f"decode_{cache.capacity}.onnx"
-                self.decode_session = ort.InferenceSession(str(path), options, providers=providers)
-                self.decode_capacity = cache.capacity
-            session = self.decode_session
-        binding = session.io_binding()
-        # Keep tensor owners alive through execution; bind pointers also supports bool.
-        tensors = []
-        for name, value in feed.items():
-            tensor = torch.from_numpy(np.ascontiguousarray(value)).to(device)
-            if tensor.is_floating_point():
-                tensor = tensor.to(self.dtype)
-            tensors.append(tensor)
-            element_type = 16 if tensor.dtype == torch.bfloat16 else value.dtype
-            binding.bind_input(name, device, 0, element_type, tuple(tensor.shape), tensor.data_ptr())
-        for i, value in enumerate(cache.values):
-            binding.bind_ortvalue_input(f"past_{i}", value)
-            binding.bind_ortvalue_output(f"present_{i}", value if inplace else cache.spare[i])
-        binding.bind_output("logits", device)
-        binding.bind_output("next_token", device)
-        if device == "cuda":
-            torch.cuda.synchronize()
-        session.run_with_iobinding(binding)
-        binding.synchronize_outputs()
-        # Outputs follow binding order, not graph order.
-        result = binding.get_outputs()
-        if not inplace:
-            cache.values, cache.spare = cache.spare, cache.values
-        logits = result[-2]
-        cache.length += np.asarray(ids).size
-        return ort_numpy(logits), cache
+        return logits, present
 
 
-class OnnxAligner(OnnxAudioModel):
-    text_graph = "aligner.onnx"
+def compare(actual, expected, atol):
+    actual, expected = actual.float().cpu(), expected.float().cpu()
+    error = (actual - expected).abs().max().item()
+    return {
+        "passed": bool(torch.isfinite(actual).all() and torch.isfinite(expected).all() and error <= atol),
+        "max_abs_error": error,
+    }
 
-    def align(self, inputs, word_lists):
-        audio = self.encode(inputs)
-        feed = decoder_inputs(
-            inputs["input_ids"].numpy(),
-            audio,
-            self.metadata["audio_token_id"],
-            self.metadata["text_config"]["hidden_size"],
-            0,
+
+def compare_cache(actual, expected, length, atol):
+    values = [value for layer in expected.layers for value in (layer.keys, layer.values)]
+    checks = [compare(a[:, :, :length], b, atol) for a, b in zip(actual, values, strict=True)]
+    return {"passed": all(c["passed"] for c in checks), "max_abs_error": max(c["max_abs_error"] for c in checks)}
+
+
+def generate_onnx(reference, runner, inputs, embeddings, capacity, session, max_new_tokens):
+    cache, length = runner.empty_cache(capacity), 0
+
+    def forward(input_ids, input_features=None, input_features_mask=None, attention_mask=None, **kwargs):
+        nonlocal cache, length
+        ids = input_ids[:, length:]
+        logits, cache = runner.step(
+            ids, embeddings if length == 0 else None, cache, length, session if length else None
         )
-        timestamp_id = self.metadata["timestamp_token_id"]
-        indices = np.flatnonzero(feed["input_ids"][0] == timestamp_id).astype(np.int64)
-        if not len(indices):
-            raise ValueError("Transcript has no alignable words")
-        feed["timestamp_indices"] = indices
-        logits = ort_numpy(self.run(self.decoder, feed)[0])
-        items = self.processor.decode_forced_alignment(
-            torch.from_numpy(logits),
-            torch.full((1, len(indices)), timestamp_id),
-            word_lists,
-            timestamp_id,
-            self.metadata["timestamp_segment_time"],
-        )[0]
-        return logits, items
+        length += ids.shape[1]
+        return CausalLMOutputWithPast(logits=logits[:, None].to(input_ids.device))
+
+    # HF owns token selection and stopping. Only graph execution is replaced.
+    with patch.object(reference, "forward", forward):
+        return reference.generate(**inputs, use_cache=False, do_sample=False, max_new_tokens=max_new_tokens)
 
 
-def validate_asr(args):
-    metadata = json.loads((args.onnx_dir / "metadata.json").read_text(encoding="utf-8"))
-    dtype = getattr(torch, metadata["dtype"])
+def validate_asr(args, runner, reference, inputs, ref_inputs):
+    length = inputs["input_ids"].shape[1]
+    required = length + args.max_new_tokens
+    metadata = runner.metadata
+    capacity = metadata["cache_capacity"]
+    if metadata.get("dynamic_cache_capacity"):
+        capacity = min(capacity, max(4, 1 << (required - 1).bit_length()))
+    if required > capacity:
+        raise ValueError("Prompt and generation budget exceed exported cache capacity")
+    specialized = metadata.get("decode_capacities", [])
+    bucket = next((c for c in sorted(specialized) if capacity <= c <= metadata["cache_capacity"]), None)
+    if bucket is not None and metadata.get("dynamic_cache_capacity"):
+        capacity = bucket
+    session = runner.session(f"decode_{capacity}.onnx") if capacity in specialized else None
+    audio = runner.encode(inputs)
+    expected_audio = reference.get_audio_features(
+        ref_inputs["input_features"], ref_inputs["input_features_mask"]
+    ).pooler_output
+    expected = reference(**ref_inputs, use_cache=True, logits_to_keep=1)
+    logits, cache = runner.step(inputs["input_ids"], audio, runner.empty_cache(capacity), 0)
+    checks = {
+        "encoder": compare(audio, expected_audio, args.atol),
+        "prefill_logits": compare(logits, expected.logits[:, -1], args.atol),
+        "prefill_kv": compare_cache(cache, expected.past_key_values, length, args.atol),
+    }
+    token = expected.logits[:, -1].argmax(-1, keepdim=True)
+    next_expected = reference(input_ids=token, past_key_values=expected.past_key_values, use_cache=True)
+    for name, decoder in [("cached", runner.decoder)] + ([("specialized", session)] if session else []):
+        next_logits, present = runner.step(token, None, cache, length, decoder)
+        checks[f"{name}_logits"] = compare(next_logits, next_expected.logits[:, -1], args.atol)
+        checks[f"{name}_kv"] = compare_cache(present, next_expected.past_key_values, length + 1, args.atol)
+    expected_ids = reference.generate(**ref_inputs, do_sample=False, max_new_tokens=args.max_new_tokens)
+    actual_ids = generate_onnx(reference, runner, ref_inputs, audio, capacity, session, args.max_new_tokens)
+    expected_tokens, actual_tokens = expected_ids[0, length:].tolist(), actual_ids[0, length:].tolist()
+    eos = metadata["eos_token_ids"]
+    exact = expected_tokens == actual_tokens
+    stopped = bool(expected_tokens and actual_tokens and expected_tokens[-1] in eos and actual_tokens[-1] in eos)
+    return {
+        "checks": checks,
+        "exact_token_match": exact,
+        "reached_eos": stopped,
+        "reference_tokens": expected_tokens,
+        "onnx_tokens": actual_tokens,
+        "passed": all(c["passed"] for c in checks.values()) and exact and stopped,
+    }
+
+
+def validate_aligner(args, runner, reference, inputs, ref_inputs, words):
+    audio = runner.encode(inputs)
+    expected_audio = reference.model.get_audio_features(
+        ref_inputs["input_features"], ref_inputs["input_features_mask"]
+    ).pooler_output
+    expected = reference(**ref_inputs, use_cache=False).logits.cpu()
+    timestamp_id = reference.config.timestamp_token_id
+    indices = (inputs["input_ids"][0] == timestamp_id).nonzero().flatten()
+    feed = decoder_inputs(
+        inputs["input_ids"], audio, runner.metadata["audio_token_id"], runner.metadata["text_config"]["hidden_size"], 0
+    )
+    feed["timestamp_indices"] = indices
+    logits = runner.run(runner.decoder, feed)[0]
+    processor = runner.processor
+    expected_spans = processor.decode_forced_alignment(expected.float(), inputs["input_ids"], words, timestamp_id)[0]
+    actual_spans = processor.decode_forced_alignment(
+        logits.float(), torch.full((1, len(indices)), timestamp_id), words, timestamp_id
+    )[0]
+    checks = {
+        "encoder": compare(audio, expected_audio, args.atol),
+        "timestamp_logits": compare(logits, expected[:, indices], args.atol),
+    }
+    exact = actual_spans == expected_spans
+    return {
+        "checks": checks,
+        "exact_spans": exact,
+        "reference_spans": expected_spans,
+        "onnx_spans": actual_spans,
+        "passed": all(c["passed"] for c in checks.values()) and exact,
+    }
+
+
+@torch.inference_mode()
+def validate(args):
+    runner = OnnxAudioModel(args.onnx_dir, args.task, args.threads, args.provider)
+    model_type = Qwen3ASRForConditionalGeneration if args.task == "asr" else Qwen3ASRForTokenClassification
     reference = (
-        Qwen3ASRForConditionalGeneration.from_pretrained(
-            args.model, revision=args.revision, dtype=dtype, attn_implementation="eager"
-        )
+        model_type.from_pretrained(args.model, revision=args.revision, dtype=runner.dtype, attn_implementation="eager")
         .to(args.reference_device)
         .eval()
     )
-    runner = OnnxASR(args.onnx_dir, args.threads, args.provider)
     reports = []
-    with torch.inference_mode():
-        for path in args.audio:
-            print(f"Validating {path}", flush=True)
-            audio = load_audio(path)
+    for path in args.audio:
+        if args.task == "asr":
             inputs = runner.processor.apply_transcription_request(
-                audio=audio, language=args.language, return_tensors="pt"
+                audio=str(path), language=args.language, return_tensors="pt"
             )
-            ref_inputs = {
-                k: v.to(device=args.reference_device, dtype=dtype if v.is_floating_point() else v.dtype)
-                for k, v in inputs.items()
-            }
-            reference_audio = (
-                reference.get_audio_features(ref_inputs["input_features"], ref_inputs["input_features_mask"])
-                .pooler_output.float()
-                .cpu()
-                .numpy()
+        else:
+            inputs, words = runner.processor.prepare_forced_aligner_inputs(
+                audio=str(path),
+                transcript=args.transcript.read_text(encoding="utf-8-sig").strip(),
+                language=args.language,
+                return_tensors="pt",
             )
-            actual_audio = runner.encode(inputs)
-            encoder_error = float(np.max(np.abs(reference_audio - actual_audio)))
-            start = time.perf_counter()
-            output = reference.generate(
-                **ref_inputs,
-                do_sample=False,
-                max_new_tokens=args.max_new_tokens,
-                return_dict_in_generate=True,
-                output_scores=True,
-            )
-            reference_seconds = time.perf_counter() - start
-            expected = output.sequences[0, inputs["input_ids"].shape[1] :].tolist()
-            start = time.perf_counter()
-            cache = runner.empty_cache(inputs["input_ids"].shape[1] + args.max_new_tokens)
-            ids, generated, errors = inputs["input_ids"].numpy(), [], []
-            embeddings = actual_audio
-            cache_pointers = {v.data_ptr() for v in cache.values + cache.spare}
-            for index in range(args.max_new_tokens):
-                logits, cache = runner.step(ids, embeddings, cache)
-                assert cache_pointers == {v.data_ptr() for v in cache.values + cache.spare}
-                if runner.provider == "trt-rtx":
-                    assert all(v.device_name() == "cuda" for v in cache.values)
-                token = int(logits.argmax(-1)[0])
-                generated.append(token)
-                # Compare scores only while both generation histories are identical.
-                if index < len(output.scores) and generated[:-1] == expected[:index]:
-                    errors.append(float(np.max(np.abs(logits - output.scores[index].float().cpu().numpy()))))
-                if token in runner.metadata["eos_token_ids"]:
-                    break
-                ids, embeddings = np.array([[token]], np.int64), None
-            onnx_seconds = time.perf_counter() - start
-            stopped = (
-                generated[-1] in runner.metadata["eos_token_ids"] and expected[-1] in runner.metadata["eos_token_ids"]
-            )
-            token_match = generated == expected
-            numeric_parity = bool(
-                np.isfinite(encoder_error)
-                and encoder_error <= args.atol
-                and len(errors) == len(expected)
-                and all(np.isfinite(e) and e <= args.atol for e in errors)
-            )
-            passed = bool(stopped and token_match and numeric_parity)
-            report = {
-                "audio": str(path.resolve()),
-                "audio_sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
-                "duration_seconds": len(audio) / 16000,
-                "passed": passed,
-                "numeric_parity": numeric_parity,
-                "encoder_max_abs_error": encoder_error,
-                "logits_max_abs_error": max(errors, default=None),
-                "exact_token_match": token_match,
-                "reached_eos": stopped,
-                "reference_tokens": expected,
-                "onnx_tokens": generated,
-                "reference_text": runner.processor.decode(expected, return_format="parsed"),
-                "onnx_text": runner.processor.decode(generated, return_format="parsed"),
-                "reference_generate_seconds": reference_seconds,
-                "onnx_decode_seconds": onnx_seconds,
-            }
-            reports.append(report)
-            print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
+            if not words[0]:
+                raise ValueError("Transcript must contain alignable words")
+        ref_inputs = {
+            k: v.to(device=args.reference_device, dtype=runner.dtype if v.is_floating_point() else v.dtype)
+            for k, v in inputs.items()
+        }
+        report = (
+            validate_asr(args, runner, reference, inputs, ref_inputs)
+            if args.task == "asr"
+            else validate_aligner(args, runner, reference, inputs, ref_inputs, words)
+        )
+        reports.append({"audio": str(path), **report})
     payload = {
         "passed": all(r["passed"] for r in reports),
-        "outputs_match": all(r["exact_token_match"] and r["reached_eos"] for r in reports),
         "atol": args.atol,
         "provider": runner.provider,
-        "dtype": metadata["dtype"],
-        "reference_device": args.reference_device,
-        "source": runner.metadata.get("source"),
+        "dtype": str(runner.dtype),
+        "source": runner.metadata["source"],
         "cases": reports,
     }
     args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    args.report.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    print(json.dumps(payload, indent=2, ensure_ascii=False))
     raise SystemExit(0 if payload["passed"] else 1)
-
-
-def validate_aligner(args):
-    audio = load_audio(args.audio[0])
-    if len(audio) > 300 * 16000:
-        raise ValueError("Standalone aligner inputs must be at most 300 seconds")
-    text = args.transcript.read_text(encoding="utf-8").strip()
-    metadata = json.loads((args.onnx_dir / "metadata.json").read_text(encoding="utf-8"))
-    dtype = getattr(torch, metadata["dtype"])
-    reference = (
-        Qwen3ASRForTokenClassification.from_pretrained(
-            args.model, revision=args.revision, dtype=dtype, attn_implementation="eager"
-        )
-        .to(args.reference_device)
-        .eval()
-    )
-    runner = OnnxAligner(args.onnx_dir, args.threads, args.provider)
-    inputs, words = runner.processor.prepare_forced_aligner_inputs(
-        audio=audio, transcript=text, language=args.language, return_tensors="pt"
-    )
-    if not words[0]:
-        raise ValueError("Transcript must contain alignable words")
-    with torch.inference_mode():
-        ref_inputs = {
-            k: v.to(device=args.reference_device, dtype=dtype if v.is_floating_point() else v.dtype)
-            for k, v in inputs.items()
-        }
-        ref_audio = reference.model.get_audio_features(
-            ref_inputs["input_features"], ref_inputs["input_features_mask"]
-        ).pooler_output
-        encoder_error = float(np.max(np.abs(ref_audio.float().cpu().numpy() - runner.encode(inputs))))
-        expected_logits = reference(**ref_inputs, use_cache=False).logits.float().cpu()
-        timestamp_id = reference.config.timestamp_token_id
-        expected_slots = expected_logits[:, inputs["input_ids"][0] == timestamp_id].numpy()
-        expected_items = runner.processor.decode_forced_alignment(
-            expected_logits, inputs["input_ids"], words, timestamp_id
-        )[0]
-        actual_slots, actual_items = runner.align(inputs, words)
-    error = float(np.max(np.abs(expected_slots - actual_slots)))
-    classes_match = bool(np.array_equal(expected_slots.argmax(-1), actual_slots.argmax(-1)))
-    numeric_parity = bool(
-        np.isfinite(error) and error <= args.atol and np.isfinite(encoder_error) and encoder_error <= args.atol
-    )
-    passed = bool(numeric_parity and classes_match and expected_items == actual_items)
-    report = {
-        "passed": passed,
-        "numeric_parity": numeric_parity,
-        "provider": runner.provider,
-        "dtype": metadata["dtype"],
-        "reference_device": args.reference_device,
-        "atol": args.atol,
-        "source": runner.metadata.get("source"),
-        "audio": str(args.audio[0].resolve()),
-        "audio_sha256": hashlib.sha256(args.audio[0].read_bytes()).hexdigest(),
-        "transcript": text,
-        "encoder_max_abs_error": encoder_error,
-        "timestamp_logits_max_abs_error": error,
-        "exact_timestamp_classes": classes_match,
-        "exact_spans": expected_items == actual_items,
-        "reference_spans": expected_items,
-        "onnx_spans": actual_items,
-    }
-    args.report.parent.mkdir(parents=True, exist_ok=True)
-    args.report.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps(report, ensure_ascii=False, indent=2), flush=True)
-    raise SystemExit(0 if passed else 1)
 
 
 def main():
@@ -490,9 +375,7 @@ def main():
     torch.set_num_threads(args.threads)
     if args.task == "aligner":
         args.language = args.language or "English"
-        validate_aligner(args)
-    else:
-        validate_asr(args)
+    validate(args)
 
 
 if __name__ == "__main__":

@@ -84,6 +84,9 @@ Increase `--max-new-tokens` from 512 for longer speech.
 ./.venv/Scripts/python.exe -X utf8 asr/qwen3/model_export/validate_qwen3_asr.py --task aligner --audio recording.wav --transcript transcript.txt --language Chinese
 ```
 
+The validator compares encoder, prefill and cached-token outputs against HF,
+then uses HF `generate()` for a short end-to-end token/EOS check. Alignment uses
+HF transcript preparation and span decoding. It checks correctness, not speed.
 Use `--onnx-dir` for a different export. Short English fixtures match HF tokens
 for both ASR sizes; English word and Chinese character spans match HF. Repeated
 calls and simultaneous ASR/standalone alignment pass. Strict BF16 logit tolerances
