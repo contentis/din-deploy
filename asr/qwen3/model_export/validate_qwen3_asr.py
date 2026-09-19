@@ -82,7 +82,7 @@ class OnnxAudioModel:
         self.metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
         self.processor = AutoProcessor.from_pretrained(directory / "processor", local_files_only=True)
         self.dtype = getattr(torch, self.metadata["dtype"])
-        self.provider = provider or ("trt-rtx" if self.dtype == torch.bfloat16 else "cpu")
+        self.provider = provider or ("trt-rtx" if self.dtype in (torch.float16, torch.bfloat16) else "cpu")
         options, providers = session_options(self.provider, threads)
         self.encoder = ort.InferenceSession(str(directory / "encoder.onnx"), options, providers=providers)
         if self.text_graph == "decoder.onnx":

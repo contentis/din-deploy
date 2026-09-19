@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Export Qwen3-ASR in checkpoint precision (BF16), with explicit tensor interfaces."""
+"""Export Qwen3-ASR with explicit tensor interfaces; checkpoint BF16 is the default."""
 
 import argparse
 import json
@@ -66,6 +66,8 @@ def save_native_assets(processor, output, task):
 
 
 def decode_attention(module, query, key, value, attention_mask, scaling=None, **kwargs):
+    if query.dtype == torch.float32:
+        return export_attention(module, query, key, value, attention_mask, scaling, **kwargs)
     output = F.scaled_dot_product_attention(
         query,
         key,
@@ -194,13 +196,11 @@ def export_attention(module, query, key, value, attention_mask, scaling=None, **
     query = query.reshape(batch, kv_heads, groups * sequence, width)
     if attention_mask is not None:
         attention_mask = attention_mask.repeat(1, 1, groups, 1)
-    output = F.scaled_dot_product_attention(
-        query,
-        key,
-        value,
-        attn_mask=attention_mask,
-        scale=scaling,
-    )
+    # TensorRT RTX 1.6 has no fused FP32 Attention kernel for this graph.
+    if query.dtype == torch.float32:
+        output = attention(query, key, value, attention_mask, scaling)
+    else:
+        output = F.scaled_dot_product_attention(query, key, value, attn_mask=attention_mask, scale=scaling)
     output = output.reshape(batch, heads, sequence, width)
     return output.transpose(1, 2), None
 
@@ -290,7 +290,7 @@ def main():
     parser.add_argument("--revision", help="Optional HF revision or commit")
     parser.add_argument("--output", type=Path, help="Defaults to the ONNX artifact directory for --task")
     parser.add_argument("--task", choices=["asr", "aligner"], default="asr")
-    parser.add_argument("--dtype", choices=["original", "fp32"], default="original")
+    parser.add_argument("--dtype", choices=["original", "fp16", "fp32"], default="original")
     parser.add_argument("--only", choices=["mel", "encoder", "decoder", "decode", "aligner"])
     parser.add_argument(
         "--decode-capacities",
@@ -305,7 +305,7 @@ def main():
     args.model = args.model or (
         "Qwen/Qwen3-ForcedAligner-0.6B-hf" if args.task == "aligner" else f"Qwen/Qwen3-ASR-{args.size}-hf"
     )
-    precision = "bf16" if args.dtype == "original" else "fp32"
+    precision = "bf16" if args.dtype == "original" else args.dtype
     size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in args.model.lower() else ""
     args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}{size_suffix}")
     if args.threads < 1:
@@ -320,6 +320,12 @@ def main():
         parser.error("TensorRT RTX 1.6 GQA decode supports up to 16384 slots; larger buckets use the general decoder")
     if args.only == "decode" and (not args.decode_capacities or not (args.output / "metadata.json").exists()):
         parser.error("--only decode requires --decode-capacities and an existing ASR export")
+    metadata_path = args.output / "metadata.json"
+    if args.only not in (None, "mel") and metadata_path.exists():
+        existing = json.loads(metadata_path.read_text(encoding="utf-8"))
+        requested = {"original": "bfloat16", "fp16": "float16", "fp32": "float32"}[args.dtype]
+        if existing["dtype"] != requested:
+            parser.error("Partial export must keep the existing precision; use a separate output directory")
     torch.set_num_threads(args.threads)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.only == "decoder" and args.task != "asr" or args.only == "aligner" and args.task != "aligner":
@@ -333,7 +339,7 @@ def main():
     model_class = Qwen3ASRForConditionalGeneration if args.task == "asr" else Qwen3ASRForTokenClassification
     model = model_class.from_pretrained(
         args.model,
-        dtype="auto" if args.dtype == "original" else torch.float32,
+        dtype={"original": "auto", "fp16": torch.float16, "fp32": torch.float32}[args.dtype],
         attn_implementation="eager",
         revision=args.revision,
     ).eval()

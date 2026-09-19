@@ -1,14 +1,14 @@
 # Qwen3 ASR and forced alignment
 
-Offline C++ inference with TensorRT RTX and original BF16 weights.
+Offline C++ inference with TensorRT RTX in BF16 (default), FP16 or FP32.
 
 ## Supported models
 
-| Model | Hugging Face ID | Checkpoint | BF16 export | Recommended export |
-| --- | --- | --- | --- | --- |
-| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | BF16 |
-| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | BF16 |
-| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | BF16 |
+| Model | Hugging Face ID | Checkpoint | BF16 export | FP16 export | FP32 export | Recommended export |
+| --- | --- | --- | --- | --- | --- | --- |
+| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
+| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
+| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
 
 ## Supported capabilities
 
@@ -43,12 +43,24 @@ python -X utf8 export_qwen3_asr.py --size 1.7B --output D:/models/qwen3-asr-1.7b
 python -X utf8 export_qwen3_asr.py --task aligner --output D:/models/qwen3-aligner-onnx-bf16
 ```
 
+Use `--dtype fp16` or `--dtype fp32` for converted exports; `--dtype original`
+keeps BF16. This applies to both ASR sizes and the aligner.
+
+```bash
+python -X utf8 export_qwen3_asr.py --dtype fp16 --output D:/models/qwen3-asr-0.6b-onnx-fp16
+python -X utf8 export_qwen3_asr.py --dtype fp32 --output D:/models/qwen3-asr-0.6b-onnx-fp32
+```
+
+The C++ pipeline reads precision from each export; ASR and aligner can use different
+precisions. FP32 uses decomposed attention for TensorRT RTX compatibility; BF16/FP16
+use fused attention. Log-mel stays FP32. Use separate output directories per precision.
+
 HF downloads checkpoints automatically. Use `--model` for a local checkpoint or
 `--revision` to pin the source. Keep each export directory intact. Log-mel
 processing reuses the shared Whisper frontend.
 
 For faster cached decoding, add `--decode-capacities 1024 2048 4096 8192` to the
-ASR export command. These graphs use standard ONNX Attention and TensorScatter;
+ASR export command. These graphs use standard ONNX operations, including TensorScatter;
 there are no contrib ops. KV updates are in-place only on this specialized path.
 The general decoder uses separate cache banks. Attention scans allocated capacity.
 
@@ -69,7 +81,7 @@ words; long-form alignment has small endpoint differences from HF.
 ## Build
 
 Build from the repository root with the same TensorRT RTX setup as Whisper.
-A BF16-capable NVIDIA GPU is required.
+An NVIDIA GPU supporting the selected TensorRT RTX precision is required.
 
 ```powershell
 cmake --build out\build\windows-x64 --target din_asr_qwen3_cli

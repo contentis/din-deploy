@@ -13,6 +13,8 @@
 #include <sstream>
 #include <stdexcept>
 #include <string_view>
+#include <type_traits>
+#include <variant>
 
 #include "nvtx_helper.h"
 #include "ort_session.h"
@@ -332,6 +334,88 @@ using BF16 = Ort::BFloat16_t;
 using din::common::OrtRunner;
 template <class T>
 using Buffer = din::common::TensorBuffer<T>;
+class FloatBuffer
+{
+    using Storage = std::variant<Buffer<float>, Buffer<Ort::Float16_t>, Buffer<BF16>>;
+    Storage buffer_;
+
+    static Storage Make(OrtRunner& runner, const std::vector<int64_t>& shape, ONNXTensorElementDataType dtype,
+                        bool disable_uma)
+    {
+        switch (dtype)
+        {
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+            return Storage(std::in_place_type<Buffer<float>>, runner, shape, true, disable_uma);
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+            return Storage(std::in_place_type<Buffer<Ort::Float16_t>>, runner, shape, true, disable_uma);
+        case ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16:
+            return Storage(std::in_place_type<Buffer<BF16>>, runner, shape, true, disable_uma);
+        default:
+            throw std::runtime_error("Unsupported Qwen3 tensor precision");
+        }
+    }
+
+public:
+    FloatBuffer(OrtRunner& runner, const std::vector<int64_t>& shape, ONNXTensorElementDataType dtype,
+                bool disable_uma = false)
+        : buffer_(Make(runner, shape, dtype, disable_uma))
+    {
+    }
+
+    template <class F>
+    void WithHost(F&& fill)
+    {
+        std::visit(
+            [&](auto& buffer)
+            {
+                fill(buffer.HostData());
+            },
+            buffer_);
+    }
+    void Fill(float value)
+    {
+        std::visit(
+            [&](auto& buffer)
+            {
+                using T = std::remove_pointer_t<decltype(buffer.HostData())>;
+                buffer.Fill(T(value));
+            },
+            buffer_);
+    }
+    Ort::Value& BindingValue()
+    {
+        return std::visit(
+            [](auto& buffer) -> Ort::Value&
+            {
+                return buffer.BindingValue();
+            },
+            buffer_);
+    }
+    void CopyAsyncToDevice()
+    {
+        std::visit(
+            [](auto& buffer)
+            {
+                buffer.CopyAsyncToDevice();
+            },
+            buffer_);
+    }
+    void UploadAndWait()
+    {
+        std::visit(
+            [](auto& buffer)
+            {
+                buffer.CopyAsyncToDeviceWithNotification().Sync();
+            },
+            buffer_);
+    }
+};
+
+size_t ElementBytes(const Ort::Value& value)
+{
+    return value.GetTensorTypeAndShapeInfo().GetElementType() == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT ? 4 : 2;
+}
+
 constexpr int kRate = 16000;
 constexpr int kMaxSamples = 1205 * kRate;
 constexpr int kPrefillBlock = 512;
@@ -343,8 +427,8 @@ int64_t AudioTokens(int64_t frames)
 
 void ZeroDevice(OrtRunner& runner, Ort::Value& value)
 {
-    const auto status = cudaMemsetAsync(value.GetTensorMutableData<BF16>(), 0,
-                                        value.GetTensorTypeAndShapeInfo().GetElementCount() * sizeof(BF16),
+    const auto status = cudaMemsetAsync(value.GetTensorMutableRawData(), 0,
+                                        value.GetTensorTypeAndShapeInfo().GetElementCount() * ElementBytes(value),
                                         reinterpret_cast<cudaStream_t>(runner.compute_stream->GetHandle()));
     if (status != cudaSuccess)
         throw std::runtime_error(cudaGetErrorString(status));
@@ -363,9 +447,9 @@ void Append(std::vector<int64_t>& dst, const std::vector<int64_t>& src)
     dst.insert(dst.end(), src.begin(), src.end());
 }
 
-Ort::Value DeviceValue(OrtRunner& runner, const std::vector<int64_t>& shape)
+Ort::Value DeviceValue(OrtRunner& runner, const std::vector<int64_t>& shape, ONNXTensorElementDataType dtype)
 {
-    return Ort::Value::CreateTensor<BF16>(runner.DeviceAllocator(), shape.data(), shape.size());
+    return Ort::Value::CreateTensor(runner.DeviceAllocator(), shape.data(), shape.size(), dtype);
 }
 
 struct EncodedAudio
@@ -374,10 +458,14 @@ struct EncodedAudio
     Ort::Value values;
 };
 
-void CopyDevice(OrtRunner& runner, BF16* dst, const BF16* src, size_t count)
+void CopyDevice(OrtRunner& runner, Ort::Value& dst, const Ort::Value& src, size_t count, size_t dst_offset = 0,
+                size_t src_offset = 0)
 {
-    const auto status = cudaMemcpyAsync(dst, src, count * sizeof(BF16), cudaMemcpyDeviceToDevice,
-                                        reinterpret_cast<cudaStream_t>(runner.compute_stream->GetHandle()));
+    const auto bytes = ElementBytes(dst);
+    const auto status =
+        cudaMemcpyAsync(static_cast<char*>(dst.GetTensorMutableRawData()) + dst_offset * bytes,
+                        static_cast<const char*>(src.GetTensorRawData()) + src_offset * bytes, count * bytes,
+                        cudaMemcpyDeviceToDevice, reinterpret_cast<cudaStream_t>(runner.compute_stream->GetHandle()));
     if (status != cudaSuccess)
         throw std::runtime_error(cudaGetErrorString(status));
 }
@@ -416,17 +504,17 @@ struct TextInputs
 {
     Buffer<int64_t> ids, positions;
     Ort::Value audio;
-    Buffer<BF16> bias;
+    FloatBuffer bias;
     Buffer<bool> mask;
     int64_t sequence, hidden, capacity;
     OrtRunner& runner;
     bool mask_uploaded = false;
 
-    TextInputs(OrtRunner& runner, int64_t seq, int64_t width, int64_t keys)
+    TextInputs(OrtRunner& runner, int64_t seq, int64_t width, int64_t keys, ONNXTensorElementDataType dtype)
         : ids(runner, {1, seq}, true)
         , positions(runner, {1, seq}, true)
-        , audio(DeviceValue(runner, {1, seq, width}))
-        , bias(runner, {1, 1, seq, keys}, true)
+        , audio(DeviceValue(runner, {1, seq, width}, dtype))
+        , bias(runner, {1, 1, seq, keys}, dtype)
         , mask(runner, {1, seq, 1}, true)
         , sequence(seq)
         , hidden(width)
@@ -457,10 +545,18 @@ struct TextInputs
                     throw std::runtime_error("Too many audio placeholders");
                 ++audio_pos;
             }
-            const int64_t visible = start + i + 1;
-            std::fill_n(bias.HostData() + i * capacity, visible, BF16(0.f));
-            std::fill_n(bias.HostData() + i * capacity + visible, capacity - visible, BF16(-1e4f));
         }
+        bias.WithHost(
+            [&](auto* data)
+            {
+                using T = std::remove_pointer_t<decltype(data)>;
+                for (int64_t i = 0; i < sequence; ++i)
+                {
+                    const int64_t visible = start + i + 1;
+                    std::fill_n(data + i * capacity, visible, T(0.f));
+                    std::fill_n(data + i * capacity + visible, capacity - visible, T(-1e4f));
+                }
+            });
         ids.CopyAsyncToDevice();
         positions.CopyAsyncToDevice();
         // Audio placeholders form contiguous runs; assemble embeddings directly on
@@ -476,8 +572,7 @@ struct TextInputs
             const int64_t begin = i;
             while (i < sequence && tokens[i] == audio_id)
                 ++i;
-            CopyDevice(runner, audio.GetTensorMutableData<BF16>() + begin * hidden,
-                       embeddings->values.GetTensorData<BF16>() + audio_pos * hidden, (i - begin) * hidden);
+            CopyDevice(runner, audio, embeddings->values, (i - begin) * hidden, begin * hidden, audio_pos * hidden);
             audio_pos += i - begin;
         }
         if (!mask_uploaded || mask_changed)
@@ -504,6 +599,7 @@ struct Qwen3Pipeline::Impl
     struct Model
     {
         Json metadata, native;
+        ONNXTensorElementDataType dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
         std::unique_ptr<din::io::Tokenizer> tokenizer;
         std::unique_ptr<OrtRunner> encoder, text, decode_alt;
         int64_t hidden = 0, audio_id = 0;
@@ -511,22 +607,22 @@ struct Qwen3Pipeline::Impl
         struct EncoderBuffers
         {
             int64_t frames, tokens;
-            Buffer<BF16> mel, bias;
+            FloatBuffer mel, bias;
             Buffer<int64_t> indices;
             Ort::Value output;
             Ort::IoBinding binding;
 
-            EncoderBuffers(OrtRunner& runner, int64_t count, int64_t hidden)
+            EncoderBuffers(OrtRunner& runner, int64_t count, int64_t hidden, ONNXTensorElementDataType dtype)
                 : frames(count)
                 , tokens(AudioTokens(count))
-                , mel(runner, {(count + 99) / 100, 128, 100}, true, true)
-                , bias(runner, {1, 1, tokens, tokens}, true)
+                , mel(runner, {(count + 99) / 100, 128, 100}, dtype, true)
+                , bias(runner, {1, 1, tokens, tokens}, dtype)
                 , indices(runner, {tokens}, true)
-                , output(DeviceValue(runner, {tokens, hidden}))
+                , output(DeviceValue(runner, {tokens, hidden}, dtype))
                 , binding(runner.session)
             {
                 // A call contains exactly one independent HF encoder window.
-                bias.Fill(BF16(0.f));
+                bias.Fill(0.f);
                 for (int64_t i = 0; i < tokens; ++i)
                     indices.HostData()[i] = i;
                 bias.CopyAsyncToDevice();
@@ -545,7 +641,7 @@ struct Qwen3Pipeline::Impl
         {
             const int64_t window = metadata["audio_config"]["n_window_infer"];
             const int64_t tokens = AudioTokens(frames);
-            EncodedAudio result{tokens, DeviceValue(*encoder, {tokens, hidden})};
+            EncodedAudio result{tokens, DeviceValue(*encoder, {tokens, hidden}, dtype)};
             Ort::RunOptions options;
             options.AddConfigEntry("disable_synchronize_execution_providers", "1");
             int64_t token_offset = 0;
@@ -555,20 +651,23 @@ struct Qwen3Pipeline::Impl
                 const auto count = std::min(window, frames - offset);
                 auto& buffers = count == window ? full_window : tail_window;
                 if (!buffers || buffers->frames != count)
-                    buffers = std::make_unique<EncoderBuffers>(*encoder, count, hidden);
+                    buffers = std::make_unique<EncoderBuffers>(*encoder, count, hidden, dtype);
                 auto& input = *buffers;
-                input.mel.Fill(BF16(0.f));
-                for (int64_t c = 0; c < (count + 99) / 100; ++c)
-                    for (int64_t m = 0; m < 128; ++m)
-                        for (int64_t f = 0; f < 100 && c * 100 + f < count; ++f)
-                            input.mel.HostData()[(c * 128 + m) * 100 + f] =
-                                BF16(features[m * frames + offset + c * 100 + f]);
+                input.mel.Fill(0.f);
+                input.mel.WithHost(
+                    [&](auto* data)
+                    {
+                        using T = std::remove_pointer_t<decltype(data)>;
+                        for (int64_t c = 0; c < (count + 99) / 100; ++c)
+                            for (int64_t m = 0; m < 128; ++m)
+                                for (int64_t f = 0; f < 100 && c * 100 + f < count; ++f)
+                                    data[(c * 128 + m) * 100 + f] = T(features[m * frames + offset + c * 100 + f]);
+                    });
                 // Complete only the upload before reusing host staging. The next
                 // window's CPU preparation can overlap this window's inference.
-                input.mel.CopyAsyncToDeviceWithNotification().Sync();
+                input.mel.UploadAndWait();
                 encoder->session.Run(options, input.binding);
-                CopyDevice(*encoder, result.values.GetTensorMutableData<BF16>() + token_offset * hidden,
-                           input.output.GetTensorData<BF16>(), input.tokens * hidden);
+                CopyDevice(*encoder, result.values, input.output, input.tokens * hidden, token_offset * hidden);
                 token_offset += input.tokens;
             }
             return result;
@@ -670,9 +769,9 @@ struct Qwen3Pipeline::Impl
         const std::vector<int64_t> shape{1, c["num_key_value_heads"], capacity, c["head_dim"]};
         for (auto& buffers : cache)
             for (int i = 0; i < 2 * layers; ++i)
-                buffers.push_back(DeviceValue(*asr.text, shape));
-        step = std::make_unique<TextInputs>(*asr.text, 1, asr.hidden, capacity);
-        logits = DeviceValue(*asr.text, {1, c["vocab_size"]});
+                buffers.push_back(DeviceValue(*asr.text, shape, asr.dtype));
+        step = std::make_unique<TextInputs>(*asr.text, 1, asr.hidden, capacity, asr.dtype);
+        logits = DeviceValue(*asr.text, {1, c["vocab_size"]}, asr.dtype);
         next_token = std::make_unique<Buffer<int64_t>>(*asr.text, std::vector<int64_t>{1}, true);
         for (int bank = 0; bank < (fast_decode ? 1 : 2); ++bank)
         {
@@ -712,8 +811,17 @@ struct Qwen3Pipeline::Impl
         model.metadata = ReadJson(dir / "metadata.json");
         model.native = ReadJson(dir / "native.json");
         const auto& meta = model.metadata;
-        if (meta.at("format_version") != 2 || meta.at("dtype") != "bfloat16" || meta.at("task") != task)
-            throw std::runtime_error("Native Qwen3 requires format-2 BF16 " + task + " exports");
+        if (meta.at("format_version") != 2 || meta.at("task") != task)
+            throw std::runtime_error("Native Qwen3 requires format-2 " + task + " exports");
+        const auto precision = meta.at("dtype").get<std::string>();
+        if (precision == "bfloat16")
+            model.dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
+        else if (precision == "float16")
+            model.dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+        else if (precision == "float32")
+            model.dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
+        else
+            throw std::runtime_error("Unsupported Qwen3 export precision: " + precision);
         if (task == "aligner" && !meta.value("timestamp_bins", false))
             throw std::runtime_error("Re-export the aligner with --only aligner for GPU timestamp selection");
         if (meta["audio_config"]["num_mel_bins"] != 128 || meta["audio_config"]["n_window"] != 50)
@@ -825,11 +933,11 @@ struct Qwen3Pipeline::Impl
         const auto seq = static_cast<int64_t>(ids.size());
         if (seq > 8192)
             throw std::runtime_error("Alignment exceeds the native context limit");
-        TextInputs input(*model.text, seq, model.hidden, seq);
+        TextInputs input(*model.text, seq, model.hidden, seq, model.dtype);
         input.Fill(ids, 0, model.audio_id, &audio);
         const int64_t labels = model.metadata["num_labels"];
         Buffer<int64_t> indices(*model.text, {static_cast<int64_t>(slots.size())}, true);
-        auto logits = DeviceValue(*model.text, {1, static_cast<int64_t>(slots.size()), labels});
+        auto logits = DeviceValue(*model.text, {1, static_cast<int64_t>(slots.size()), labels}, model.dtype);
         Buffer<int64_t> output(*model.text, {1, static_cast<int64_t>(slots.size())}, true);
         std::copy(slots.begin(), slots.end(), indices.HostData());
         indices.CopyAsyncToDevice();
@@ -888,7 +996,7 @@ struct Qwen3Pipeline::Impl
             auto& runner = bank ? asr.decode_alt : asr.text;
             auto& prefill = (block.size() == kPrefillBlock ? prefill_full : prefill_tail)[bank];
             if (!prefill || prefill->sequence != static_cast<int64_t>(block.size()))
-                prefill = std::make_unique<TextInputs>(*runner, block.size(), asr.hidden, capacity);
+                prefill = std::make_unique<TextInputs>(*runner, block.size(), asr.hidden, capacity, asr.dtype);
             prefill->Fill(block, offset, asr.audio_id, &encoded, audio_offset);
             audio_offset += std::count(block.begin(), block.end(), asr.audio_id);
             Ort::IoBinding binding(runner->session);
@@ -903,7 +1011,7 @@ struct Qwen3Pipeline::Impl
             // One handoff copy, on the shared stream. Decode then updates this bank
             // in place with stable graph addresses; prefill remains non-aliasing.
             for (size_t i = 0; i < cache[0].size(); ++i)
-                CopyDevice(*asr.text, cache[0][i].GetTensorMutableData<BF16>(), cache[bank][i].GetTensorData<BF16>(),
+                CopyDevice(*asr.text, cache[0][i], cache[bank][i],
                            cache[0][i].GetTensorTypeAndShapeInfo().GetElementCount());
             bank = 0;
         }
