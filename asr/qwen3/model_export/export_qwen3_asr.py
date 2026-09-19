@@ -3,12 +3,12 @@
 
 import argparse
 import json
+import sys
 from pathlib import Path
 
 import onnx
 import torch
 import transformers
-from _internal.frontend import LogMel, save_native_assets
 from torch import nn
 from torch.nn import functional as F
 from transformers import (
@@ -17,6 +17,137 @@ from transformers import (
     Qwen3ASRForConditionalGeneration,
     Qwen3ASRForTokenClassification,
 )
+from transformers.models.qwen3_asr.processing_qwen3_asr import LANGUAGE_CODE_TO_NAME
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+from common.model_export.log_mel import LogMel as WhisperMel  # noqa: E402
+
+
+class LogMel(WhisperMel):
+    def __init__(self, processor):
+        fe = processor.feature_extractor
+        if (fe.n_fft, fe.hop_length, fe.feature_size, fe.sampling_rate, fe.dither) != (400, 160, 128, 16000, 0):
+            raise ValueError("Native frontend requires the standard Qwen3 16 kHz configuration")
+        super().__init__(fe.mel_filters.T.copy(), torch.float32, frames=None)
+
+
+def save_native_assets(processor, output, task):
+    tokenizer = processor.tokenizer
+
+    def encode(text):
+        return tokenizer.encode(text, add_special_tokens=False)
+
+    data = {
+        "audio_start": encode(processor.audio_bos_token),
+        "audio_end": encode(processor.audio_eos_token),
+    }
+    if task == "asr":
+        prefixes = {}
+        suffixes = {}
+        languages = {}
+        for language in [None, *LANGUAGE_CODE_TO_NAME.values()]:
+            messages = [{"role": "user", "content": [{"type": "audio"}]}]
+            rendered = tokenizer.apply_chat_template(
+                messages, chat_template=processor.chat_template, tokenize=False, add_generation_prompt=True
+            )
+            prefix, suffix = rendered.split(processor.audio_token)
+            prefixes[language or "auto"] = encode(prefix)
+            suffixes[language or "auto"] = encode(suffix + (f"language {language}<asr_text>" if language else ""))
+            languages[language or "auto"] = language or ""
+        for code, language in LANGUAGE_CODE_TO_NAME.items():
+            prefixes[code] = prefixes[language]
+            suffixes[code] = suffixes[language]
+            languages[code] = language
+        data["prefixes"] = prefixes
+        data["suffixes"] = suffixes
+        data["languages"] = languages
+        data["suffix"] = suffixes["auto"]
+    (output / "native.json").write_text(json.dumps(data, indent=2), encoding="utf-8")
+
+
+def decode_attention(module, query, key, value, attention_mask, scaling=None, **kwargs):
+    output = F.scaled_dot_product_attention(
+        query,
+        key,
+        value,
+        attn_mask=attention_mask,
+        scale=scaling,
+        enable_gqa=query.shape[1] != key.shape[1],
+    )
+    return output.transpose(1, 2), None
+
+
+class DecodeCache:
+    def __init__(self, past, positions):
+        self.past, self.positions, self.present = past, positions.reshape(-1), []
+
+    def update(self, key, value, layer_idx):
+        updated = []
+        for cache, data in zip(self.past[2 * layer_idx : 2 * layer_idx + 2], (key, value), strict=True):
+            if torch.onnx.is_in_onnx_export():
+                data = torch.onnx.ops.symbolic(
+                    "TensorScatter",
+                    (cache, data, self.positions[:1]),
+                    {"axis": 2, "mode": "linear"},
+                    dtype=data.dtype,
+                    shape=cache.shape,
+                    version=24,
+                )
+            else:
+                data = cache.index_copy(2, self.positions, data)
+            updated.append(data)
+        self.present.extend(updated)
+        return tuple(updated)
+
+
+def export_decode(decoder, config, dtype, output, capacities):
+    AttentionInterface.register("qwen3_onnx_decode", decode_attention)
+    decoder.decoder.config._attn_implementation = "qwen3_onnx_decode"
+    decoder.cache_type = DecodeCache
+    past = tuple(
+        torch.zeros(1, config.num_key_value_heads, 4, config.head_dim, dtype=dtype)
+        for _ in range(2 * config.num_hidden_layers)
+    )
+    inputs = (
+        torch.ones(1, 1, dtype=torch.int64),
+        torch.zeros(1, 1, config.hidden_size, dtype=dtype),
+        torch.zeros(1, 1, 1, dtype=torch.bool),
+        torch.zeros(1, 1, dtype=torch.int64),
+        torch.zeros(1, 1, 1, 4, dtype=dtype),
+        *past,
+    )
+    cap = torch.export.Dim("capacity", min=4)
+    names = ["input_ids", "audio_embeddings", "audio_mask", "position_ids", "attention_bias"]
+    # Export weights once; specialized graph headers share the same external data.
+    template = output / "decode.onnx"
+    torch.onnx.export(
+        decoder.eval(),
+        inputs,
+        str(template),
+        dynamo=True,
+        opset_version=24,
+        external_data=True,
+        input_names=names + [f"past_{i}" for i in range(len(past))],
+        output_names=["logits", "next_token"] + [f"present_{i}" for i in range(len(past))],
+        dynamic_shapes={
+            "input_ids": {},
+            "audio_embeddings": {},
+            "audio_mask": {},
+            "position_ids": {},
+            "attention_bias": {3: cap},
+            "past": tuple({2: cap} for _ in past),
+        },
+    )
+    for capacity in sorted(set(capacities)):
+        graph = onnx.load(template, load_external_data=False)
+        for value in list(graph.graph.input) + list(graph.graph.output) + list(graph.graph.value_info):
+            for dim in value.type.tensor_type.shape.dim:
+                if dim.dim_param == "capacity":
+                    dim.dim_value = capacity
+        path = output / f"decode_{capacity}.onnx"
+        onnx.save(graph, path)
+        onnx.checker.check_model(str(path))
+        print(f"Checked {path}", flush=True)
 
 
 def attention(q, k, v, bias, scale):
@@ -155,6 +286,7 @@ def export(module, args, path, names, outputs, shapes):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", "--checkpoint", dest="model", help="HF model ID or local checkpoint directory")
+    parser.add_argument("--size", choices=["0.6B", "1.7B"], default="0.6B", help="ASR model size")
     parser.add_argument("--revision", help="Optional HF revision or commit")
     parser.add_argument("--output", type=Path, help="Defaults to the ONNX artifact directory for --task")
     parser.add_argument("--task", choices=["asr", "aligner"], default="asr")
@@ -171,10 +303,11 @@ def main():
     args = parser.parse_args()
     prefix = "aligner-" if args.task == "aligner" else ""
     args.model = args.model or (
-        "Qwen/Qwen3-ForcedAligner-0.6B-hf" if args.task == "aligner" else "Qwen/Qwen3-ASR-0.6B-hf"
+        "Qwen/Qwen3-ForcedAligner-0.6B-hf" if args.task == "aligner" else f"Qwen/Qwen3-ASR-{args.size}-hf"
     )
     precision = "bf16" if args.dtype == "original" else "fp32"
-    args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}")
+    size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in args.model.lower() else ""
+    args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}{size_suffix}")
     if args.threads < 1:
         parser.error("threads must be positive")
     if args.cache_capacity < 4:
@@ -220,7 +353,6 @@ def main():
     if cfg.text_config.rope_parameters["rope_type"] != "default":
         raise ValueError("Only default RoPE is supported by this draft")
     if args.only == "decode":
-        from _internal.decode import export_decode
 
         metadata = json.loads((args.output / "metadata.json").read_text(encoding="utf-8"))
         if (
@@ -310,7 +442,6 @@ def main():
                 },
             )
     if args.decode_capacities:
-        from _internal.decode import export_decode
 
         with torch.inference_mode():
             export_decode(TextDecoder(model), cfg.text_config, dtype, args.output, args.decode_capacities)

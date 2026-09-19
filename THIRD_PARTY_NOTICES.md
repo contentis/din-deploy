@@ -74,7 +74,7 @@ For components supplied through an SDK or binary package, the corresponding vend
 
 ## Model/Artifact
 
-- Qwen3-ASR-0.6B-hf and Qwen3-ForcedAligner-0.6B-hf: Apache-2.0. Checkpoints are downloaded separately from [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) and [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf). The draft export adapters follow the architectures in Hugging Face Transformers (Apache-2.0).
+- Qwen3-ASR-0.6B-hf, Qwen3-ASR-1.7B-hf and Qwen3-ForcedAligner-0.6B-hf: Apache-2.0. Checkpoints are downloaded separately from [Qwen3-ASR](https://huggingface.co/Qwen/Qwen3-ASR-0.6B-hf) and [Qwen3-ForcedAligner](https://huggingface.co/Qwen/Qwen3-ForcedAligner-0.6B-hf). The draft export adapters follow the architectures in Hugging Face Transformers (Apache-2.0).
   Native alignment word cleanup and timestamp repair follow [Transformers Qwen3-ASR processing](https://github.com/huggingface/transformers/blob/v5.13.0/src/transformers/models/qwen3_asr/processing_qwen3_asr.py) (Apache-2.0, copyright Hugging Face).
   Native long-form splitting, output parsing and repetition cleanup follow [Qwen3-ASR inference utilities](https://github.com/QwenLM/Qwen3-ASR/blob/main/qwen_asr/inference/utils.py) (Apache-2.0, copyright 2026 The Alibaba Qwen team).
 

@@ -19,7 +19,8 @@ struct Qwen3Config
     std::filesystem::path ep_cache_dir = "artifacts/qwen3/rt_cache";
     std::filesystem::path ep_context_dir = "artifacts/qwen3/ep_context";
     std::string lang_id = "auto";
-    int max_new_tokens = 512;  // Official Transformers wrapper default; increase for long speech.
+    int max_new_tokens = 512;   // Official Transformers wrapper default; increase for long speech.
+    int max_chunk_seconds = 0;  // Zero selects 1200 for ASR or 180 with alignment; boundaries may add 5 s.
     din::common::ProgressCallback progress;
 };
 
@@ -54,7 +55,22 @@ public:
     TranscriptionResult TranscribeFile(const std::filesystem::path& path);
 
 private:
+    friend class Qwen3ForcedAligner;
     struct Impl;
     std::unique_ptr<Impl> impl_;
+};
+
+class Qwen3ForcedAligner
+{
+public:
+    explicit Qwen3ForcedAligner(Qwen3Config config = {});
+    ~Qwen3ForcedAligner();
+    std::vector<WordTimestamp> Align(const din::io::Audio& audio, const std::string& text,
+                                     const std::string& language = "English");
+    std::vector<WordTimestamp> AlignFile(const std::filesystem::path& path, const std::string& text,
+                                         const std::string& language = "English");
+
+private:
+    std::unique_ptr<Qwen3Pipeline::Impl> impl_;
 };
 }  // namespace din::asr::qwen3

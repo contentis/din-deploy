@@ -20,7 +20,7 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 | NVIDIA Parakeet TDT 0.6B v3 | `nvidia/parakeet-tdt-0.6b-v3` | [RNNT](asr/rnnt/README.md) |
 | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | `nvidia/nemotron-3.5-asr-streaming-0.6b` | [RNNT](asr/rnnt/README.md) |
 
-Experimental BF16 ONNX export, validation, and a native offline single-stream pipeline with optional English forced alignment are available in [Qwen3](asr/qwen3/README.md), including a capability/support matrix and current parity limitations.
+[Qwen3](asr/qwen3/README.md) supports BF16 0.6B/1.7B offline ASR, long audio, and standalone English word or Chinese/Cantonese character alignment.
 
 ### Computer Vision
 

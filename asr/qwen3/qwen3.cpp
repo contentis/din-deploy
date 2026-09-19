@@ -5,18 +5,323 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <fstream>
 #include <span>
+#include <sstream>
 #include <stdexcept>
+#include <string_view>
 
-#include "internal/chunks.h"
-#include "internal/text.h"
 #include "nvtx_helper.h"
 #include "ort_session.h"
 #include "tokenizer.h"
 #include <nlohmann/json.hpp>
+
+namespace din::asr::qwen3::detail
+{
+inline int ResolveChunkSeconds(int seconds, bool aligned)
+{
+    const int limit = aligned ? 180 : 1200;
+    if (seconds == 0)
+        return limit;
+    // A target inside the search radius can repeatedly split silence into single samples.
+    if (seconds <= 5 || seconds > limit)
+        throw std::invalid_argument(aligned ? "max-chunk-seconds must be 0 (auto) or 6..180 with alignment"
+                                            : "max-chunk-seconds must be 0 (auto) or 6..1200");
+    return seconds;
+}
+
+struct AudioChunk
+{
+    size_t begin;
+    size_t end;
+};
+
+inline float WindowEnergy(std::span<const float> samples, size_t begin)
+{
+    // Independent FP32 reductions avoid cancellation drift across quiet windows.
+    std::array<float, 8> sums{};
+    for (size_t i = 0; i < 1600; i += 8)
+        for (size_t j = 0; j < 8; ++j)
+            sums[j] += std::abs(samples[begin + i + j]);
+    return ((sums[0] + sums[1]) + (sums[2] + sums[3])) + ((sums[4] + sums[5]) + (sums[6] + sums[7]));
+}
+
+// Qwen3-ASR split_audio_into_chunks: quietest 100 ms within +/-5 seconds,
+// then the quietest sample inside that window. Keep the first minimum on ties.
+inline std::vector<AudioChunk> SplitAudio(std::span<const float> samples, size_t target_seconds = 1200)
+{
+    const size_t target = target_seconds * 16000;
+    constexpr size_t expand = 5 * 16000, window = 1600;
+    std::vector<AudioChunk> chunks;
+    size_t start = 0;
+    while (samples.size() - start > target)
+    {
+        const auto cut = start + target;
+        const auto left = cut > expand ? std::max(start, cut - expand) : start;
+        const auto right = std::min(samples.size(), cut + expand);
+        size_t boundary = cut;
+        if (right - left > window)
+        {
+            float best = WindowEnergy(samples, left);
+            size_t minimum = left;
+            for (size_t i = left + 1; i + window <= right; ++i)
+            {
+                const float sum = WindowEnergy(samples, i);
+                if (sum < best)
+                {
+                    best = sum;
+                    minimum = i;
+                }
+            }
+            boundary = minimum;
+            for (size_t i = minimum + 1; i < minimum + window; ++i)
+                if (std::abs(samples[i]) < std::abs(samples[boundary]))
+                    boundary = i;
+        }
+        boundary = std::clamp(boundary, start + 1, samples.size());
+        chunks.push_back({start, boundary});
+        start = boundary;
+    }
+    if (start < samples.size())
+        chunks.push_back({start, samples.size()});
+    return chunks;
+}
+}  // namespace din::asr::qwen3::detail
+
+namespace din::asr::qwen3::detail
+{
+std::string Trim(const std::string& text)
+{
+    const auto first = text.find_first_not_of(" \r\n\t");
+    if (first == std::string::npos)
+        return {};
+    return text.substr(first, text.find_last_not_of(" \r\n\t") - first + 1);
+}
+
+// Official detect_and_fix_repetitions operates on Unicode characters, not UTF-8 bytes.
+static std::string FixRepetitions(const std::string& text)
+{
+    std::vector<std::string_view> chars, filtered;
+    for (size_t i = 0; i < text.size();)
+    {
+        const auto c = static_cast<unsigned char>(text[i]);
+        const size_t length = c < 0x80 ? 1 : c < 0xe0 ? 2 : c < 0xf0 ? 3 : 4;
+        chars.emplace_back(text.data() + i, std::min(length, text.size() - i));
+        i += length;
+    }
+    for (size_t i = 0; i < chars.size();)
+    {
+        size_t end = i + 1;
+        while (end < chars.size() && chars[end] == chars[i])
+            ++end;
+        filtered.insert(filtered.end(), chars.begin() + i, chars.begin() + (end - i > 20 ? i + 1 : end));
+        i = end;
+    }
+    std::string result;
+    for (size_t i = 0; i < filtered.size();)
+    {
+        size_t advance = 1, keep = 1;
+        if (filtered.size() - i >= 40)
+            for (size_t length = 1; length <= 20 && i + length * 20 <= filtered.size(); ++length)
+            {
+                size_t end = i + length;
+                while (end + length <= filtered.size() &&
+                       std::equal(filtered.begin() + i, filtered.begin() + i + length, filtered.begin() + end))
+                    end += length;
+                if ((end - i) / length >= 20)
+                {
+                    keep = length;
+                    advance = end - i;
+                    break;
+                }
+            }
+        for (size_t j = 0; j < keep; ++j)
+            result += filtered[i + j];
+        i += advance;
+    }
+    return result;
+}
+
+std::pair<std::string, std::string> ParseOutput(const std::string& raw, const std::string& forced_language = {})
+{
+    const auto text = FixRepetitions(Trim(raw));
+    if (text.empty())
+        return {};
+    if (!forced_language.empty())
+        return {forced_language, text};
+    const auto marker = text.find("<asr_text>");
+    if (marker == std::string::npos)
+        return {{}, Trim(text)};
+    auto meta = text.substr(0, marker);
+    std::transform(meta.begin(), meta.end(), meta.begin(),
+                   [](unsigned char c)
+                   {
+                       return std::tolower(c);
+                   });
+    const auto transcript = Trim(text.substr(marker + 10));
+    if (meta.find("language none") != std::string::npos)
+        return {{}, transcript};
+    std::istringstream lines(meta);
+    std::string line;
+    while (std::getline(lines, line))
+    {
+        line = Trim(line);
+        if (line.starts_with("language "))
+        {
+            auto language = Trim(line.substr(9));
+            if (!language.empty())
+                language[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(language[0])));
+            return {language, transcript};
+        }
+    }
+    return {{}, transcript};
+}
+
+std::vector<std::string> EnglishWords(const std::string& text)
+{
+    std::vector<std::string> words;
+    std::string word;
+    std::string cleaned = text;
+    // HF drops typographic punctuation, including curly apostrophes (only ASCII ' is kept).
+    for (const auto* punctuation : {"\xe2\x80\x93", "\xe2\x80\x94", "\xe2\x80\x98", "\xe2\x80\x99", "\xe2\x80\x9c",
+                                    "\xe2\x80\x9d", "\xe2\x80\xa6"})
+    {
+        size_t pos = 0;
+        while ((pos = cleaned.find(punctuation, pos)) != std::string::npos)
+            cleaned.erase(pos, 3);
+    }
+    for (unsigned char c : cleaned)
+    {
+        if (c >= 128)
+            throw std::runtime_error("Native alignment currently requires ASCII English text");
+        if (std::isspace(c))
+        {
+            if (!word.empty())
+                words.push_back(std::move(word));
+            word.clear();
+        }
+        else if (std::isalnum(c) || c == '\'')
+            word.push_back(static_cast<char>(c));
+    }
+    if (!word.empty())
+        words.push_back(std::move(word));
+    return words;
+}
+
+std::vector<std::string> AlignmentUnits(const std::string& text, const std::string& language)
+{
+    if (language == "English" || language == "en")
+        return EnglishWords(text);
+    if (language != "Chinese" && language != "zh" && language != "Cantonese" && language != "yue")
+        throw std::invalid_argument("Native alignment supports English, Chinese and Cantonese");
+    std::vector<std::string> units;
+    std::string word;
+    const auto flush = [&]
+    {
+        if (!word.empty())
+            units.push_back(std::move(word));
+        word.clear();
+    };
+    for (size_t i = 0; i < text.size();)
+    {
+        const auto begin = i;
+        const auto first = static_cast<unsigned char>(text[i++]);
+        const int bytes = first < 0x80                     ? 1
+                          : first >= 0xc2 && first <= 0xdf ? 2
+                          : first >= 0xe0 && first <= 0xef ? 3
+                          : first >= 0xf0 && first <= 0xf4 ? 4
+                                                           : 0;
+        if (!bytes || begin + bytes > text.size())
+            throw std::invalid_argument("Invalid UTF-8 transcript");
+        uint32_t code = first & (bytes == 1 ? 0x7f : bytes == 2 ? 0x1f : bytes == 3 ? 0x0f : 0x07);
+        for (int j = 1; j < bytes; ++j)
+        {
+            const auto next = static_cast<unsigned char>(text[i++]);
+            if ((next & 0xc0) != 0x80)
+                throw std::invalid_argument("Invalid UTF-8 transcript");
+            code = (code << 6) | (next & 0x3f);
+        }
+        if ((bytes == 2 && code < 0x80) || (bytes == 3 && code < 0x800) || (bytes == 4 && code < 0x10000) ||
+            code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff))
+            throw std::invalid_argument("Invalid UTF-8 transcript");
+        const bool cjk = (code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf) ||
+                         (code >= 0x20000 && code <= 0x2a6df) || (code >= 0x2a700 && code <= 0x2b73f) ||
+                         (code >= 0x2b740 && code <= 0x2b81f) || (code >= 0x2b820 && code <= 0x2ceaf) ||
+                         (code >= 0xf900 && code <= 0xfaff) || (code >= 0x2f800 && code <= 0x2fa1f);
+        if (cjk)
+        {
+            flush();
+            units.push_back(text.substr(begin, bytes));
+        }
+        else if (code < 128)
+        {
+            if (std::isspace(static_cast<unsigned char>(code)))
+                flush();
+            else if (std::isalnum(static_cast<unsigned char>(code)) || code == '\'')
+                word.push_back(static_cast<char>(code));
+        }
+        else if (code == 0x3000 || code == 0xa0 || (code >= 0x2000 && code <= 0x200a) || code == 0x2028 ||
+                 code == 0x2029)
+            flush();
+        else if ((code >= 0x2010 && code <= 0x2027) || (code >= 0x3001 && code <= 0x301f) ||
+                 (code >= 0xff01 && code <= 0xff0f) || (code >= 0xff1a && code <= 0xff20) ||
+                 (code >= 0xff3b && code <= 0xff40) || (code >= 0xff5b && code <= 0xff65))
+            continue;
+        else
+            throw std::invalid_argument("Unsupported non-CJK character in alignment transcript");
+    }
+    flush();
+    return units;
+}
+
+// HF's nondecreasing subsequence repair, including its tie rules.
+std::vector<int> FixTimestamps(const std::vector<int>& data)
+{
+    const int n = static_cast<int>(data.size());
+    if (n == 0)
+        return {};
+    std::vector<int> dp(n, 1), parent(n, -1), result = data;
+    std::vector<bool> normal(n, false);
+    for (int i = 1; i < n; ++i)
+        for (int j = 0; j < i; ++j)
+            if (data[j] <= data[i] && dp[j] + 1 > dp[i])
+            {
+                dp[i] = dp[j] + 1;
+                parent[i] = j;
+            }
+    int i = static_cast<int>(std::max_element(dp.begin(), dp.end()) - dp.begin());
+    for (; i >= 0; i = parent[i])
+        normal[i] = true;
+    for (int begin = 0; begin < n;)
+    {
+        if (normal[begin])
+        {
+            ++begin;
+            continue;
+        }
+        int end = begin;
+        while (end < n && !normal[end])
+            ++end;
+        for (int k = begin; k < end; ++k)
+        {
+            if (begin == 0)
+                result[k] = result[end];
+            else if (end == n)
+                result[k] = result[begin - 1];
+            else if (end - begin <= 2)
+                result[k] = k - begin + 1 <= end - k ? result[begin - 1] : result[end];
+            else
+                result[k] = static_cast<int>(result[begin - 1] + (result[end] - result[begin - 1]) *
+                                                                     float(k - begin + 1) / (end - begin + 1));
+        }
+        begin = end;
+    }
+    return result;
+}
+}  // namespace din::asr::qwen3::detail
 
 namespace din::asr::qwen3
 {
@@ -77,7 +382,36 @@ void CopyDevice(OrtRunner& runner, BF16* dst, const BF16* src, size_t count)
         throw std::runtime_error(cudaGetErrorString(status));
 }
 
-// Same shared TensorBuffer staging and stream ordering as the other ASR samples.
+const din::io::Audio& NormalizeAudio(const din::io::Audio& audio, din::io::Audio& normalized)
+{
+    if (audio.sample_rate != kRate || audio.samples.empty())
+        throw std::runtime_error("Expected nonempty mono 16 kHz audio");
+    if (std::any_of(audio.samples.begin(), audio.samples.end(),
+                    [](float x)
+                    {
+                        return !std::isfinite(x);
+                    }))
+        throw std::runtime_error("Audio contains non-finite samples");
+    const float peak = std::abs(*std::max_element(audio.samples.begin(), audio.samples.end(),
+                                                  [](float a, float b)
+                                                  {
+                                                      return std::abs(a) < std::abs(b);
+                                                  }));
+    const auto* source = &audio;
+    if (peak > 1.f)
+    {
+        normalized.sample_rate = kRate;
+        normalized.samples.resize(audio.samples.size());
+        std::transform(audio.samples.begin(), audio.samples.end(), normalized.samples.begin(),
+                       [peak](float x)
+                       {
+                           return x / peak;
+                       });
+        source = &normalized;
+    }
+    return *source;
+}
+
 struct TextInputs
 {
     Buffer<int64_t> ids, positions;
@@ -204,8 +538,7 @@ struct Qwen3Pipeline::Impl
             }
         };
 
-        // Bound retained storage to a full window and the current tail, keeping
-        // addresses stable across full windows and repeated same-shape requests.
+        // Stable addresses for repeated full windows and the current tail.
         std::unique_ptr<EncoderBuffers> full_window, tail_window;
 
         EncodedAudio Encode(const std::vector<float>& features, int64_t frames)
@@ -260,18 +593,23 @@ struct Qwen3Pipeline::Impl
     int64_t fast_capacity = 0, spare_capacity = 0;
     Ort::RunOptions decode_options;
 
-    explicit Impl(Qwen3Config cfg)
+    explicit Impl(Qwen3Config cfg, bool alignment_only = false)
         : config(std::move(cfg))
     {
         if (config.max_new_tokens <= 0)
             throw std::runtime_error("max-new-tokens must be positive");
+        config.max_chunk_seconds = detail::ResolveChunkSeconds(config.max_chunk_seconds, !config.aligner_dir.empty());
         decode_options.AddConfigEntry("disable_synchronize_execution_providers", "1");
         din::common::RegisterTensorRTRTXProvider(env);
         stream = din::common::CreateTensorRTRTXComputeStream(env);
-        LoadModel(asr, config.model_dir, "asr");
-        if (!asr.native["prefixes"].contains(config.lang_id))
-            throw std::runtime_error("Unknown language hint");
-        mel = Runner(config.model_dir, "mel", "samples:1x8000", "samples:1x2880000", "samples:1x19280000");
+        if (!alignment_only)
+        {
+            LoadModel(asr, config.model_dir, "asr");
+            if (!asr.native["prefixes"].contains(config.lang_id))
+                throw std::runtime_error("Unknown language hint");
+        }
+        mel = Runner(alignment_only ? config.aligner_dir : config.model_dir, "mel", "samples:1x8000",
+                     "samples:1x2880000", "samples:1x19280000");
         if (!config.aligner_dir.empty())
         {
             aligner = std::make_unique<Model>();
@@ -459,14 +797,12 @@ struct Qwen3Pipeline::Impl
         din::common::nvtx_scoped_range range{"qwen3.align"};
         if (result.text.empty())
             return;
-        if (result.language != "English")
-            throw std::runtime_error("Native forced alignment currently supports English only");
         auto& model = *aligner;
-        const auto words = detail::EnglishWords(result.text);
+        const auto words = detail::AlignmentUnits(result.text, result.language);
         if (words.empty())
             return;
         if (words.size() > 2048)
-            throw std::runtime_error("Native alignment is limited to 2048 words per chunk");
+            throw std::runtime_error("Native alignment is limited to 2048 alignment units per chunk");
         auto audio = [&]
         {
             din::common::nvtx_scoped_range range{"qwen3.align_encoder"};
@@ -604,40 +940,30 @@ struct Qwen3Pipeline::Impl
         return result;
     }
 
+    std::vector<WordTimestamp> AlignAudio(const din::io::Audio& audio, const std::string& text,
+                                          const std::string& language)
+    {
+        if (audio.samples.size() > 180 * kRate)
+            throw std::invalid_argument("Standalone alignment accepts up to 180 seconds; supply audio/text segments");
+        din::io::Audio normalized;
+        const auto features = Features(NormalizeAudio(audio, normalized));
+        TranscriptionResult result;
+        result.text = text;
+        result.language = language;
+        Align(result, features, features.size() / 128);
+        return result.timestamps;
+    }
+
     TranscriptionResult Transcribe(const din::io::Audio& audio)
     {
         din::common::nvtx_scoped_range range{"qwen3.transcribe"};
-        if (audio.sample_rate != kRate || audio.samples.empty())
-            throw std::runtime_error("Expected nonempty mono 16 kHz audio");
-        if (std::any_of(audio.samples.begin(), audio.samples.end(),
-                        [](float x)
-                        {
-                            return !std::isfinite(x);
-                        }))
-            throw std::runtime_error("Audio contains non-finite samples");
         const auto start = std::chrono::steady_clock::now();
-        const float peak = std::abs(*std::max_element(audio.samples.begin(), audio.samples.end(),
-                                                      [](float a, float b)
-                                                      {
-                                                          return std::abs(a) < std::abs(b);
-                                                      }));
         din::io::Audio normalized;
-        const auto* source = &audio;
-        if (peak > 1.f)
-        {
-            normalized.sample_rate = kRate;
-            normalized.samples.resize(audio.samples.size());
-            std::transform(audio.samples.begin(), audio.samples.end(), normalized.samples.begin(),
-                           [peak](float x)
-                           {
-                               return x / peak;
-                           });
-            source = &normalized;
-        }
+        const auto* source = &NormalizeAudio(audio, normalized);
         TranscriptionResult result;
         result.reached_eos = true;
         std::string previous_language;
-        for (const auto chunk : detail::SplitAudio(source->samples, aligner ? 180 : 1200))
+        for (const auto chunk : detail::SplitAudio(source->samples, config.max_chunk_seconds))
         {
             din::io::Audio input{{source->samples.begin() + chunk.begin, source->samples.begin() + chunk.end}, kRate};
             auto part = TranscribeChunk(input);
@@ -682,5 +1008,22 @@ TranscriptionResult Qwen3Pipeline::Transcribe(const din::io::Audio& audio)
 TranscriptionResult Qwen3Pipeline::TranscribeFile(const std::filesystem::path& path)
 {
     return Transcribe(din::io::LoadAudio(path.string(), kRate));
+}
+Qwen3ForcedAligner::Qwen3ForcedAligner(Qwen3Config config)
+{
+    if (config.aligner_dir.empty())
+        config.aligner_dir = "artifacts/qwen3/aligner-onnx-bf16";
+    impl_ = std::make_unique<Qwen3Pipeline::Impl>(std::move(config), true);
+}
+Qwen3ForcedAligner::~Qwen3ForcedAligner() = default;
+std::vector<WordTimestamp> Qwen3ForcedAligner::Align(const din::io::Audio& audio, const std::string& text,
+                                                     const std::string& language)
+{
+    return impl_->AlignAudio(audio, text, language);
+}
+std::vector<WordTimestamp> Qwen3ForcedAligner::AlignFile(const std::filesystem::path& path, const std::string& text,
+                                                         const std::string& language)
+{
+    return Align(din::io::LoadAudio(path.string(), kRate), text, language);
 }
 }  // namespace din::asr::qwen3
