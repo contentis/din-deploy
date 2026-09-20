@@ -8,6 +8,8 @@ DIN Deploy is distributed under the Apache License, Version 2.0. The project sou
 | dr_libs | Public domain or MIT-0: <https://github.com/mackron/dr_libs/blob/master/LICENSE> |
 | lodepng | zlib: <https://github.com/lvandeve/lodepng/blob/master/LICENSE> |
 | nlohmann/json | MIT: <https://github.com/nlohmann/json/blob/develop/LICENSE.MIT> |
+| PCRE2 | BSD-3-Clause WITH PCRE2-exception: <https://github.com/PCRE2Project/pcre2/blob/pcre2-10.46/LICENCE.md> |
+| utf8proc | MIT and Unicode data license: <https://github.com/JuliaStrings/utf8proc/blob/v2.11.0/LICENSE.md> |
 | NVIDIA NVTX | Apache-2.0 with LLVM exception: <https://github.com/NVIDIA/NVTX/blob/master/LICENSE> |
 | ONNX Runtime | MIT: <https://github.com/microsoft/onnxruntime/blob/main/LICENSE> |
 | ONNX Runtime TensorRT RTX EP ABI | Apache-2.0: <https://github.com/NVIDIA/TensorRT-RTX-EP-ABI/blob/main/LICENSE> |
@@ -30,6 +32,8 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `lodepng`: zlib
 - `nanobind` v2.9.2: BSD-3-Clause
 - `nlohmann/json` v3.11.3: MIT
+- `PCRE2` 10.46: BSD-3-Clause WITH PCRE2-exception
+- `utf8proc` 2.11.0: MIT and Unicode data license
 - NVIDIA NVTX v3.5.0 C/C++: Apache-2.0 WITH LLVM-exception
 - ONNX Runtime SDK 1.27.0: MIT
 - ONNX Runtime TensorRT RTX Execution Provider ABI: Apache-2.0

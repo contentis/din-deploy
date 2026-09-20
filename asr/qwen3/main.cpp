@@ -23,7 +23,10 @@ int main(int argc, char** argv)
         parser.add_argument("--transcript")
             .default_value(std::string{})
             .help("Align supplied UTF-8 text file without ASR");
-        parser.add_argument("--lang-id").default_value(config.lang_id);
+        parser.add_argument("--lang-id")
+            .default_value(config.lang_id)
+            .help("Language code or name (case-insensitive); auto detects ASR language, defaults to English for "
+                  "alignment");
         parser.add_argument("--ep-cache").default_value(config.ep_cache_dir.string());
         parser.add_argument("--ep-context-dir").default_value(config.ep_context_dir.string());
         parser.add_argument("--max-new-tokens").default_value(config.max_new_tokens).scan<'i', int>();

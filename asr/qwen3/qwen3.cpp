@@ -19,6 +19,7 @@
 #include "nvtx_helper.h"
 #include "ort_session.h"
 #include "tokenizer.h"
+#include "unicode_regex.h"
 #include <nlohmann/json.hpp>
 
 namespace din::asr::qwen3::detail
@@ -182,101 +183,59 @@ std::pair<std::string, std::string> ParseOutput(const std::string& raw, const st
     return {{}, transcript};
 }
 
-std::vector<std::string> EnglishWords(const std::string& text)
+std::string LowerLanguage(const std::string& language)
 {
-    std::vector<std::string> words;
-    std::string word;
-    std::string cleaned = text;
-    // HF drops typographic punctuation, including curly apostrophes (only ASCII ' is kept).
-    for (const auto* punctuation : {"\xe2\x80\x93", "\xe2\x80\x94", "\xe2\x80\x98", "\xe2\x80\x99", "\xe2\x80\x9c",
-                                    "\xe2\x80\x9d", "\xe2\x80\xa6"})
-    {
-        size_t pos = 0;
-        while ((pos = cleaned.find(punctuation, pos)) != std::string::npos)
-            cleaned.erase(pos, 3);
-    }
-    for (unsigned char c : cleaned)
-    {
-        if (c >= 128)
-            throw std::runtime_error("Native alignment currently requires ASCII English text");
-        if (std::isspace(c))
-        {
-            if (!word.empty())
-                words.push_back(std::move(word));
-            word.clear();
-        }
-        else if (std::isalnum(c) || c == '\'')
-            word.push_back(static_cast<char>(c));
-    }
-    if (!word.empty())
-        words.push_back(std::move(word));
-    return words;
+    auto result = Trim(language);
+    std::transform(result.begin(), result.end(), result.begin(),
+                   [](unsigned char c)
+                   {
+                       return static_cast<char>(std::tolower(c));
+                   });
+    return result;
+}
+
+std::string AsrLanguage(const std::string& language, const nlohmann::json& languages)
+{
+    const auto hint = LowerLanguage(language);
+    for (const auto& [key, value] : languages.items())
+        if (LowerLanguage(key) == hint)
+            return key;
+    throw std::invalid_argument("Unknown ASR language hint; use an upstream language code/name or auto");
 }
 
 std::vector<std::string> AlignmentUnits(const std::string& text, const std::string& language)
 {
-    if (language == "English" || language == "en")
-        return EnglishWords(text);
-    if (language != "Chinese" && language != "zh" && language != "Cantonese" && language != "yue")
-        throw std::invalid_argument("Native alignment supports English, Chinese and Cantonese");
-    std::vector<std::string> units;
-    std::string word;
-    const auto flush = [&]
-    {
-        if (!word.empty())
-            units.push_back(std::move(word));
-        word.clear();
-    };
-    for (size_t i = 0; i < text.size();)
-    {
-        const auto begin = i;
-        const auto first = static_cast<unsigned char>(text[i++]);
-        const int bytes = first < 0x80                     ? 1
-                          : first >= 0xc2 && first <= 0xdf ? 2
-                          : first >= 0xe0 && first <= 0xef ? 3
-                          : first >= 0xf0 && first <= 0xf4 ? 4
-                                                           : 0;
-        if (!bytes || begin + bytes > text.size())
-            throw std::invalid_argument("Invalid UTF-8 transcript");
-        uint32_t code = first & (bytes == 1 ? 0x7f : bytes == 2 ? 0x1f : bytes == 3 ? 0x0f : 0x07);
-        for (int j = 1; j < bytes; ++j)
-        {
-            const auto next = static_cast<unsigned char>(text[i++]);
-            if ((next & 0xc0) != 0x80)
-                throw std::invalid_argument("Invalid UTF-8 transcript");
-            code = (code << 6) | (next & 0x3f);
-        }
-        if ((bytes == 2 && code < 0x80) || (bytes == 3 && code < 0x800) || (bytes == 4 && code < 0x10000) ||
-            code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff))
-            throw std::invalid_argument("Invalid UTF-8 transcript");
-        const bool cjk = (code >= 0x4e00 && code <= 0x9fff) || (code >= 0x3400 && code <= 0x4dbf) ||
-                         (code >= 0x20000 && code <= 0x2a6df) || (code >= 0x2a700 && code <= 0x2b73f) ||
-                         (code >= 0x2b740 && code <= 0x2b81f) || (code >= 0x2b820 && code <= 0x2ceaf) ||
-                         (code >= 0xf900 && code <= 0xfaff) || (code >= 0x2f800 && code <= 0x2fa1f);
-        if (cjk)
-        {
-            flush();
-            units.push_back(text.substr(begin, bytes));
-        }
-        else if (code < 128)
-        {
-            if (std::isspace(static_cast<unsigned char>(code)))
-                flush();
-            else if (std::isalnum(static_cast<unsigned char>(code)) || code == '\'')
-                word.push_back(static_cast<char>(code));
-        }
-        else if (code == 0x3000 || code == 0xa0 || (code >= 0x2000 && code <= 0x200a) || code == 0x2028 ||
-                 code == 0x2029)
-            flush();
-        else if ((code >= 0x2010 && code <= 0x2027) || (code >= 0x3001 && code <= 0x301f) ||
-                 (code >= 0xff01 && code <= 0xff0f) || (code >= 0xff1a && code <= 0xff20) ||
-                 (code >= 0xff3b && code <= 0xff40) || (code >= 0xff5b && code <= 0xff65))
-            continue;
-        else
-            throw std::invalid_argument("Unsupported non-CJK character in alignment transcript");
-    }
-    flush();
-    return units;
+    static constexpr std::pair<std::string_view, std::string_view> languages[] = {
+        {"zh", "chinese"}, {"yue", "cantonese"}, {"en", "english"}, {"de", "german"},
+        {"es", "spanish"}, {"fr", "french"},     {"it", "italian"}, {"pt", "portuguese"},
+        {"ru", "russian"}, {"ko", "korean"},     {"ja", "japanese"}};
+    const auto name = LowerLanguage(language);
+    const auto found = std::find_if(std::begin(languages), std::end(languages),
+                                    [&](const auto& entry)
+                                    {
+                                        return name == entry.first || name == entry.second;
+                                    });
+    if (found == std::end(languages))
+        throw std::invalid_argument("Forced alignment supports zh, yue, en, de, es, fr, it, pt, ru, ko and ja");
+
+    // HF keeps Unicode letters/numbers and ASCII apostrophes, dropping punctuation and marks.
+    static const din::io::UnicodeRegex kept(R"([\p{L}\p{N}'\s\x{1c}-\x{1f}]+)");
+    std::string cleaned;
+    for (const auto& part : kept.FindAll(text))
+        cleaned += part;
+    static const std::string cjk = R"(\x{4e00}-\x{9fff}\x{3400}-\x{4dbf}\x{20000}-\x{2a6df}\x{2a700}-\x{2b73f})"
+                                   R"(\x{2b740}-\x{2b81f}\x{2b820}-\x{2ceaf}\x{f900}-\x{faff}\x{2f800}-\x{2fa1f})";
+    static const din::io::UnicodeRegex words("[" + cjk + "]|[^" + cjk + R"(\s\x{1c}-\x{1f}]+)");
+    // HF's unscored Korean LTokenizer splits on whitespace before cleaning each unit.
+    static const din::io::UnicodeRegex korean(R"([^\s\x{1c}-\x{1f}]+)");
+    // Japanese character timestamps avoid a separate Nagisa word-segmentation runtime.
+    static const std::string kana = R"(\x{3040}-\x{30ff}\x{31f0}-\x{31ff}\x{ff66}-\x{ff9f})";
+    static const din::io::UnicodeRegex japanese("[" + cjk + kana + "]|[^" + cjk + kana + R"(\s\x{1c}-\x{1f}]+)");
+    if (found->first == "ja")
+        return japanese.FindAll(cleaned);
+    if (found->first == "ko")
+        return korean.FindAll(cleaned);
+    return words.FindAll(cleaned);
 }
 
 // HF's nondecreasing subsequence repair, including its tie rules.
@@ -713,8 +672,7 @@ struct Qwen3Pipeline::Impl
         {
             LoadModel(asr, config.model_dir, "asr");
             eos = asr.metadata["eos_token_ids"].get<std::vector<int64_t>>();
-            if (!asr.native["prefixes"].contains(config.lang_id))
-                throw std::runtime_error("Unknown language hint");
+            config.lang_id = detail::AsrLanguage(config.lang_id, asr.native["languages"]);
         }
         mel = Runner(alignment_only ? config.aligner_dir : config.model_dir, "mel", "samples:1x8000",
                      "samples:1x2880000", "samples:1x19280000");

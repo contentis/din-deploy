@@ -22,15 +22,19 @@ Offline C++ inference with TensorRT RTX in BF16 (default), FP16 or FP32, with op
 | Standalone alignment of supplied text | ✓ |
 | Automatic language identification / language hint | ✓ |
 | Multilingual ASR: 30 languages and 22 Chinese dialects | ✓ |
-| English word timestamps | ✓ |
+| Word timestamps: en, de, es, fr, it, pt, ru, ko | ✓ |
 | Chinese / Cantonese character timestamps | ✓ |
-| All 11 upstream alignment languages | — |
+| Japanese character timestamps | ✓ |
+| All 11 upstream alignment languages | ✓ |
 
 ASR uses the [upstream model's language support](https://github.com/QwenLM/Qwen3-ASR).
-English and Chinese are validated; coverage of every language, dialect and singing
-is still missing. Alignment supports English words and Chinese/Cantonese characters
-(with Latin words preserved). English per-letter timestamps and the remaining
-alignment languages are not implemented.
+ASR accepts all 30 upstream language codes/names and `auto`; dialects use automatic
+recognition or the corresponding language hint, not separate dialect switches.
+Alignment supports Chinese, Cantonese, English, German, Spanish, French, Italian,
+Portuguese, Russian, Korean and Japanese. Japanese uses character timestamps;
+upstream's Nagisa word boundaries differ. Latin words in CJK text stay together.
+Language names/codes are case-insensitive. ASR's other languages require alignment
+to be disabled. Language coverage is not an accuracy guarantee for every dialect.
 
 ## Export
 
@@ -128,4 +132,5 @@ algorithm: 1200-second targets, or 180 with alignment, and a ±5-second search.
 `--max-chunk-seconds` overrides the target (6–1200, or 6–180 with alignment);
 zero uses the defaults. The KV budget limits this target further. This is a target,
 not a strict duration cap.
-Increase `--max-new-tokens` from 512 for longer speech.
+`--max-new-tokens` defaults to 1024 per chunk. If `reached_eos` is false, increase
+the budget or reduce `--max-chunk-seconds`; the transcript is incomplete.
