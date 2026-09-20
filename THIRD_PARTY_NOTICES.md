@@ -5,7 +5,7 @@ DIN Deploy is distributed under the Apache License, Version 2.0. The project sou
 | Component | License and notice |
 |---|---|
 | argparse | MIT: <https://github.com/p-ranav/argparse/blob/master/LICENSE> |
-| dr_libs | Public domain or MIT-0: <https://github.com/mackron/dr_libs/blob/master/LICENSE> |
+| miniaudio | MIT: <https://github.com/mackron/miniaudio/blob/0.11.23/LICENSE> |
 | lodepng | zlib: <https://github.com/lvandeve/lodepng/blob/master/LICENSE> |
 | nlohmann/json | MIT: <https://github.com/nlohmann/json/blob/develop/LICENSE.MIT> |
 | PCRE2 | BSD-3-Clause WITH PCRE2-exception: <https://github.com/PCRE2Project/pcre2/blob/pcre2-10.46/LICENCE.md> |
@@ -28,7 +28,9 @@ For components supplied through an SDK or binary package, the corresponding vend
 ## C++
 
 - `argparse` v3.2: MIT
-- `dr_libs`: Public domain or MIT-0
+- miniaudio 0.11.23, commit `f40cf03f80cdb7e741d43e53b7e706e8c1394bcf`:
+  used under its MIT license option, copyright David Reid.
+  [License](https://github.com/mackron/miniaudio/blob/0.11.23/LICENSE).
 - `lodepng`: zlib
 - `nanobind` v2.9.2: BSD-3-Clause
 - `nlohmann/json` v3.11.3: MIT
@@ -78,6 +80,13 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `transformers`: Apache-2.0
 - `wheel`: MIT
 
+## Optional audio UI dependencies
+
+- Dear ImGui 1.92.5 docking, commit `3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c`:
+  MIT, copyright Omar Cornut. [License](https://github.com/ocornut/imgui/blob/v1.92.5-docking/LICENSE.txt).
+- SDL 3.2.28, commit `7f3ae3d57459e59943a4ecfefc8f6277ec6bf540`:
+  zlib, copyright Sam Lantinga. [License](https://github.com/libsdl-org/SDL/blob/release-3.2.28/LICENSE.txt).
+
 ## Model/Artifact
 
 - `black-forest-labs/FLUX.2-klein-4b`: Apache-2.0
@@ -88,6 +97,7 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `facebook/sam2.1-hiera-base-plus`: Apache-2.0: <https://github.com/facebookresearch/sam2/blob/main/LICENSE>
 - `facebook/sam2.1-hiera-large`: Apache-2.0: <https://github.com/facebookresearch/sam2/blob/main/LICENSE>
 - `nvidia/nemotron-3.5-asr-streaming-0.6b`: [OpenMDW-1.1](https://openmdw.ai/license/)
+- `nvidia/Nemotron-3-Diarization-preview`: [NVIDIA Software and Model Evaluation License](https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-and-model-evaluation-license/)
 - `nvidia/parakeet-tdt-0.6b-v3`: [CC-BY-4.0](https://creativecommons.org/licenses/by/4.0/)
 - `onnxmodelzoo/resnet18_Opset18_timm`: Apache-2.0
 - `openai/whisper-tiny`: Apache-2.0

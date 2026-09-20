@@ -79,6 +79,7 @@ struct ParakeetConfig
     std::filesystem::path ep_cache_dir = "artifacts/parakeet/trt_rtx_cache";
     std::filesystem::path ep_context_dir = "artifacts/parakeet/ep_context";
     int64_t encoder_profile_frames = 65536;
+    din::common::ProgressCallback progress;
 };
 
 class ParakeetPipeline

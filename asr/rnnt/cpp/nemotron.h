@@ -105,6 +105,7 @@ struct NemotronConfig
     std::filesystem::path ep_cache_dir = "artifacts/nemotron/trt_rtx_cache";
     std::filesystem::path ep_context_dir = "artifacts/nemotron/ep_context";
     std::string lang_id = "auto";
+    din::common::ProgressCallback progress;
 };
 
 class NemotronPipeline

@@ -233,6 +233,7 @@ ParakeetPipeline::ParakeetPipeline(ParakeetConfig config)
 
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config_.ep_context_dir.string();
+    ep_context.progress = config_.progress;
 
     din::common::ModelProfile preprocessor_profile;
     {
@@ -331,7 +332,7 @@ TranscriptionResult ParakeetPipeline::Transcribe(const Audio& audio)
 
 TranscriptionResult ParakeetPipeline::TranscribeFile(const fs::path& audio_path)
 {
-    const auto audio = din::io::LoadAudio(audio_path.string(), static_cast<int>(metadata_.sampling_rate));
+    const auto audio = din::io::LoadAudio(audio_path, static_cast<int>(metadata_.sampling_rate));
     return Transcribe(audio);
 }
 

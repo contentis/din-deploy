@@ -21,6 +21,7 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | `nvidia/nemotron-3.5-asr-streaming-0.6b` | [RNNT](asr/rnnt/README.md) |
 | Qwen3 ASR | `Qwen/Qwen3-ASR-0.6B-hf`<br>`Qwen/Qwen3-ASR-1.7B-hf` | [Qwen3](asr/qwen3/README.md) |
 | Qwen3 Forced Aligner | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | [Qwen3](asr/qwen3/README.md) |
+| NVIDIA Nemotron 3 Diarization (preview) | `nvidia/Nemotron-3-Diarization-preview` | [Diarization](asr/diarization/README.md) |
 
 ### Computer Vision
 
@@ -99,6 +100,11 @@ cmake --build out/build/<preset> --config Release --target din_flux2_cli
 The built executable and required runtime libraries are placed under `out/build/<preset>/bin/<configuration>/` for multi-config generators.
 
 ## Usage
+
+An optional [ImGui audio workbench](apps/audio_ui/README.md) provides audio import,
+playback, model settings, text timing and queued ASR. Enable `DIN_BUILD_AUDIO_UI=ON` and
+build `din_audio_ui`. It uses SDL3/Vulkan on Windows and Linux, targeting x64 and
+ARM64; a standalone audio-shell build is available without inference SDKs.
 
 Run the desired `din_*_cli` executable from the build directory with the model directory and arguments described in its sample README. Each CLI also documents its options through `--help`.
 

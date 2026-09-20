@@ -10,7 +10,9 @@ enum class ProgressStage
     DecodingAudio,
     LoadingModel,
     CompilingModel,
-    Transcribing
+    Transcribing,
+    Aligning,
+    Diarizing
 };
 struct InferenceProgress
 {

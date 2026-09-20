@@ -45,7 +45,6 @@ set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${DIN_RUNTIME_DIR}")
 list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 include(onnxruntime)
-include(dr_libs)
 include(nlohmann_json)
 include(argparse)
 
@@ -102,6 +101,13 @@ add_subdirectory(asr/rnnt)
 add_subdirectory(vision/sam2)
 add_subdirectory(asr/whisper)
 add_subdirectory(asr/qwen3)
+add_subdirectory(asr/diarization)
+
+option(DIN_BUILD_AUDIO_UI "Build the cross-platform ImGui audio workbench" OFF)
+if(DIN_BUILD_AUDIO_UI)
+    add_subdirectory(apps/ui)
+    add_subdirectory(apps/audio_ui)
+endif()
 
 if(DIN_BUILD_TESTING)
     set(_din_cli_test_audio "${DIN_DEPLOY_ARTIFACTS_ROOT}/audio/de/schakaleundaraber_elli.mp3")

@@ -457,6 +457,7 @@ WhisperPipeline::WhisperPipeline(WhisperConfig config)
 
     EpContextOptions ep_context;
     ep_context.output_dir = config_.ep_context_dir.string();
+    ep_context.progress = config_.progress;
 
     const std::string tag = config_.model_dir.filename().string();
     ModelProfile mel_profile;
@@ -1208,6 +1209,10 @@ TranscriptionResult WhisperPipeline::Transcribe(const Audio& audio)
     size_t seek = 0;
     while (seek < total && result.windows < max_windows)
     {
+        if (config_.progress)
+            config_.progress({din::common::ProgressStage::Transcribing,
+                              "Completed windows: " + std::to_string(result.windows),
+                              double(seek) / kSampleRate, audio.Duration()});
         din::common::nvtx_scoped_range range{"transcription_window"};
         const size_t count = std::min<size_t>(kChunkSamples, total - seek);
         const double offset = double(seek) / kSampleRate;
@@ -1305,6 +1310,9 @@ TranscriptionResult WhisperPipeline::Transcribe(const Audio& audio)
         std::cerr << "[window " << result.windows << " seek=" << offset << "s -> " << double(seek) / kSampleRate << "s "
                   << result.language << "] tokens=" << tokens.size() << " avg_logprob=" << average_logprob << '\n';
     }
+    if (config_.progress)
+        config_.progress({din::common::ProgressStage::Transcribing, "Transcription complete",
+                          double(seek) / kSampleRate, audio.Duration()});
     for (const auto& segment : result.segments)
     {
         if (!result.text.empty() && !segment.text.empty())
@@ -1319,7 +1327,7 @@ TranscriptionResult WhisperPipeline::Transcribe(const Audio& audio)
 
 TranscriptionResult WhisperPipeline::TranscribeFile(const fs::path& audio_path)
 {
-    const auto audio = din::io::LoadAudio(audio_path.string(), kSampleRate);
+    const auto audio = din::io::LoadAudio(audio_path, kSampleRate);
     return Transcribe(audio);
 }
 
