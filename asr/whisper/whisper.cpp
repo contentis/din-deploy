@@ -1327,7 +1327,7 @@ TranscriptionResult WhisperPipeline::Transcribe(const Audio& audio)
 
 TranscriptionResult WhisperPipeline::TranscribeFile(const fs::path& audio_path)
 {
-    const auto audio = din::io::LoadAudio(audio_path.string(), kSampleRate);
+    const auto audio = din::io::LoadAudio(audio_path, kSampleRate);
     return Transcribe(audio);
 }
 

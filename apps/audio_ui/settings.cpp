@@ -45,16 +45,36 @@ void Workbench::LoadPreferences()
             auto& option = options_[i];
             const auto prefix = "model." + std::to_string(i) + ".";
             field(prefix + "directory", option.directory);
-            field(prefix + "aligner", option.aligner_directory);
             field(prefix + "language", option.language);
             option.provider = number(prefix + "provider", option.provider == "trt-rtx", 0, 1) ? "trt-rtx" : "cpu";
             option.max_tokens = number(prefix + "max_tokens", option.max_tokens, 1, 32768);
             option.encoder_frames = number(prefix + "encoder_frames", option.encoder_frames, 1, 1048576);
             option.cpu_sampling = number(prefix + "cpu_sampling", option.cpu_sampling, 0, 1) != 0;
         }
+        // Qwen previously forced TensorRT regardless of its saved provider.
+        if (number("version", 1, 1, 2) < 2)
+            options_[0].provider = "trt-rtx";
         model_ = number("selected_model", 0, 0, 3);
-        view_ = number("transcript_view", 0, 0, 1);
+        field("step.alignment.directory", aligner_.directory);
+        aligner_.provider = number("step.alignment.provider", 1, 0, 1) ? "trt-rtx" : "cpu";
+        aligner_.enabled = number("step.alignment.enabled", 0, 0, 1) != 0;
+        if (!values.empty() && !values.contains("step.alignment.enabled"))
+        {
+            // Migrate the previously active model's alignment choice once.
+            field("model." + std::to_string(model_) + ".aligner", aligner_.directory);
+            const auto bundled = Utf8Path(options_[model_].directory) / "aligner";
+            if (aligner_.directory.empty() && std::filesystem::is_regular_file(bundled / "metadata.json"))
+                aligner_.directory = Utf8(bundled);
+            aligner_.enabled = !aligner_.directory.empty();
+            if (aligner_.directory.empty())
+                field("model.0.aligner", aligner_.directory);
+        }
+        field("step.diarization.directory", diarizer_.directory);
+        diarizer_.provider = number("step.diarization.provider", 1, 0, 1) ? "trt-rtx" : "cpu";
+        diarizer_.enabled = number("step.diarization.enabled", 0, 0, 1) != 0;
+        view_ = number("transcript_view", 0, 0, 2);
         follow_playhead_ = number("follow_playhead", 1, 0, 1) != 0;
+        timeline_height_ = static_cast<float>(number("timeline_height", 210, 100, 10000));
         if (values.contains("import_directory"))
             import_directory_ = Utf8Path(values.at("import_directory"));
         if (values.contains("export_directory"))
@@ -69,12 +89,22 @@ void Workbench::LoadPreferences()
 }
 std::string Workbench::PreferencesText() const
 {
-    Preferences values = {{"version", "1"},
-                          {"selected_model", std::to_string(model_)},
-                          {"transcript_view", std::to_string(view_)},
-                          {"follow_playhead", std::to_string(follow_playhead_)},
-                          {"import_directory", Utf8(import_directory_)},
-                          {"export_directory", Utf8(export_directory_)}};
+    Preferences values = {
+        {"version", "2"},
+        {"selected_model", std::to_string(model_)},
+        {"transcript_view", std::to_string(view_)},
+        {"follow_playhead", std::to_string(follow_playhead_)},
+        {"timeline_height", std::to_string(static_cast<int>(timeline_height_))},
+        {"step.diarization.enabled", std::to_string(diarizer_.enabled)},
+        {"step.diarization.provider", std::to_string(diarizer_.provider == "trt-rtx")},
+        {"step.diarization.directory",
+         diarizer_.directory.empty() ? "" : Utf8(std::filesystem::absolute(Utf8Path(diarizer_.directory)))},
+        {"step.alignment.provider", std::to_string(aligner_.provider == "trt-rtx")},
+        {"step.alignment.enabled", std::to_string(aligner_.enabled)},
+        {"step.alignment.directory",
+         aligner_.directory.empty() ? "" : Utf8(std::filesystem::absolute(Utf8Path(aligner_.directory)))},
+        {"import_directory", Utf8(import_directory_)},
+        {"export_directory", Utf8(export_directory_)}};
     for (size_t i = 0; i < options_.size(); ++i)
     {
         const auto& option = options_[i];
@@ -82,9 +112,6 @@ std::string Workbench::PreferencesText() const
         // Resolve model paths when saving so a later launch from another folder works.
         values[prefix + "directory"] =
             !option.directory.empty() ? Utf8(std::filesystem::absolute(Utf8Path(option.directory))) : "";
-        values[prefix + "aligner"] = !option.aligner_directory.empty()
-                                         ? Utf8(std::filesystem::absolute(Utf8Path(option.aligner_directory)))
-                                         : "";
         values[prefix + "language"] = option.language;
         values[prefix + "provider"] = std::to_string(option.provider == "trt-rtx");
         values[prefix + "max_tokens"] = std::to_string(option.max_tokens);
@@ -133,8 +160,8 @@ std::filesystem::path Workbench::ExpectedAligner() const
     if (model_ == 0 || std::filesystem::is_regular_file(sibling / "metadata.json", ec))
         return sibling;
     // Offer the user's existing Qwen aligner to the other ASR models.
-    if (!options_[0].aligner_directory.empty())
-        return Utf8Path(options_[0].aligner_directory);
+    if (!aligner_.directory.empty())
+        return Utf8Path(aligner_.directory);
     const auto qwen = Utf8Path(options_[0].directory);
     if (std::filesystem::is_regular_file(qwen / "aligner" / "metadata.json", ec))
         return qwen / "aligner";
@@ -150,11 +177,10 @@ void Workbench::OpenDialog(int action)
             location = import_directory_;
         else if (kind == 2)
             location = Utf8Path(options_.at(action / 8).directory);
+        else if (kind == 7)
+            location = Utf8Path(diarizer_.directory);
         else if (kind == 6)
-        {
-            const auto& option = options_.at(action / 8);
-            location = !option.aligner_directory.empty() ? Utf8Path(option.aligner_directory) : ExpectedAligner();
-        }
+            location = !aligner_.directory.empty() ? Utf8Path(aligner_.directory) : ExpectedAligner();
         else
         {
             const auto& clip = clips_.at(action / 8);
@@ -170,7 +196,76 @@ void Workbench::OpenDialog(int action)
 }
 void Workbench::SetTimingModel(const std::string& path)
 {
-    options_[model_].aligner_directory = path;
+    aligner_.directory = path;
+    aligner_.enabled = !path.empty();
+}
+void Workbench::SetDiarizationModel(const std::string& path)
+{
+    diarizer_.directory = path;
+    diarizer_.enabled = !path.empty();
+}
+void Workbench::OptionalSteps()
+{
+    const float unit = ImGui::GetFontSize() / 17.f;
+    ImGui::Spacing();
+    ImGui::TextDisabled("Optional processing");
+    if (!ImGui::BeginTable("Processing steps", 4, ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_NoPadOuterX))
+        return;
+    ImGui::TableSetupColumn("Step", ImGuiTableColumnFlags_WidthFixed, 170 * unit);
+    ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthFixed, 190 * unit);
+    ImGui::TableSetupColumn("Execution", ImGuiTableColumnFlags_WidthFixed, 150 * unit);
+    ImGui::TableSetupColumn("Folder", ImGuiTableColumnFlags_WidthStretch);
+    auto row = [&](const char* label, const char* model, OptionalModel& step, int action)
+    {
+        ImGui::PushID(action);
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        const auto padding = ImGui::GetStyle().FramePadding;
+        ImGui::SetCursorPosY(ImGui::GetCursorPosY() + padding.y - unit);
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(padding.x, unit));
+        ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 3 * unit);
+        const bool changed = ImGui::Checkbox(label, &step.enabled);
+        ImGui::PopStyleVar(2);
+        if (changed && action == 6 && step.enabled && step.directory.empty())
+        {
+            const auto detected = ExpectedAligner();
+            std::error_code ec;
+            if (std::filesystem::is_regular_file(detected / "metadata.json", ec))
+                step.directory = Utf8(detected);
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip(
+                "Optional step for new transcriptions. Its model selection is retained when switched off.");
+        ImGui::BeginDisabled(!step.enabled);
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1);
+        if (ImGui::BeginCombo("##model", model))
+        {
+            ImGui::Selectable(model, true);
+            ImGui::SetItemDefaultFocus();
+            ImGui::EndCombo();
+        }
+        ImGui::TableNextColumn();
+        ImGui::SetNextItemWidth(-1);
+        int provider = step.provider == "trt-rtx";
+        if (ImGui::Combo("##ep", &provider, "CPU\0TensorRT RTX\0"))
+            step.provider = provider ? "trt-rtx" : "cpu";
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Use an FP32 model export for CPU execution.");
+        ImGui::TableNextColumn();
+        const float browse_width = ImGui::CalcTextSize("Browse...").x + 2 * ImGui::GetStyle().FramePadding.x;
+        ImGui::SetNextItemWidth(
+            std::max(50.f, ImGui::GetContentRegionAvail().x - browse_width - ImGui::GetStyle().ItemSpacing.x));
+        ImGui::InputTextWithHint("##folder", "Select an exported model folder", &step.directory);
+        ImGui::SameLine();
+        if (ImGui::Button("Browse..."))
+            OpenDialog(action);
+        ImGui::EndDisabled();
+        ImGui::PopID();
+    };
+    row("Forced alignment", "Qwen3 aligner", aligner_, 6);
+    row("Diarization", "Nemotron 3", diarizer_, 7);
+    ImGui::EndTable();
 }
 void Workbench::ModelSettings()
 {
@@ -226,34 +321,6 @@ void Workbench::ModelSettings()
     }
     else
         ImGui::TextDisabled("Native token start markers are shown automatically; end times are not supplied.");
-    ImGui::Separator();
-    {
-        ImGui::TextUnformatted("Qwen forced aligner (word timestamps)");
-        ImGui::SetNextItemWidth(-1);
-        ImGui::InputTextWithHint("##aligner", "Automatic: <model folder>/aligner", &option.aligner_directory);
-        if (ImGui::Button("Browse aligner..."))
-            OpenDialog(model_ * 8 + 6);
-        const auto expected = ExpectedAligner();
-        std::error_code ec;
-        if (option.aligner_directory.empty() && std::filesystem::is_regular_file(expected / "metadata.json", ec))
-        {
-            ImGui::SameLine();
-            if (ImGui::Button("Use detected aligner"))
-                SetTimingModel(Utf8(expected));
-            if (ImGui::IsItemHovered())
-                ImGui::SetTooltip("%s", Utf8(std::filesystem::absolute(expected)).c_str());
-        }
-        const auto selected_aligner = !option.aligner_directory.empty() ? Utf8Path(option.aligner_directory)
-                                                                        : Utf8Path(option.directory) / "aligner";
-        const bool available = std::filesystem::is_regular_file(selected_aligner / "metadata.json", ec);
-        ImGui::TextWrapped(available ? "Aligner selected: used on the next transcription."
-                           : !option.aligner_directory.empty()
-                               ? "Aligner metadata not found. Select an exported aligner folder."
-                               : "No aligner selected. Browse or use a detected export to enable word timing.");
-        ImGui::TextDisabled("Optional word timing after transcription. "
-                            "Uses TensorRT RTX even when transcription runs on CPU. "
-                            "If alignment fails, the transcript and native timing remain available.");
-    }
     ImGui::PopTextWrapPos();
     ImGui::Spacing();
     if (ImGui::Button("Done"))

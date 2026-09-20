@@ -22,11 +22,18 @@
 namespace din::studio
 {
 using Audio = din::io::Audio;
+// Optional processing models keep their selection when switched off.
+struct OptionalModel
+{
+    bool enabled = false;
+    std::string directory, provider = "trt-rtx";
+};
 struct Settings
 {
     int model = 0;
     std::string directory, provider = "cpu";
-    std::string language = "auto", aligner_directory;
+    std::string language = "auto", aligner_directory, aligner_provider = "trt-rtx";
+    std::string diarizer_directory, diarizer_provider = "trt-rtx";
     int max_tokens = 1024, encoder_frames = 65536;
     bool cpu_sampling = false;
     bool operator==(const Settings&) const = default;
@@ -37,7 +44,10 @@ class Inference
 public:
     Inference();
     ~Inference();
-    Result Run(const Settings&, const Audio&, din::common::ProgressCallback progress = {});
+    using PreparationCallback = std::function<void(int, const std::string&)>;
+    // Preparation status can arrive from the loader thread; progress stays on the caller.
+    Result Run(const Settings&, const Audio&, din::common::ProgressCallback progress = {},
+               PreparationCallback preparation = {});
 
 private:
     struct Impl;
@@ -96,6 +106,7 @@ struct JobProgress
     din::common::InferenceProgress event{din::common::ProgressStage::DecodingAudio, ""};
     std::chrono::steady_clock::time_point stage_started{}, inference_started{};
     double measured_seconds = 0;
+    std::array<std::string, 2> preparation;
 };
 class Worker
 {
@@ -159,6 +170,8 @@ public:
     bool HasTranscript() const;
     void TranscribeSelected();
     void SetTimingModel(const std::string& path);
+    void SetDiarizationModel(const std::string& path);
+    void ShowSpeakerDemo();
     void ShowModelSettings(int model);
     void SelectModel(int model);
 
@@ -169,9 +182,12 @@ private:
     void Transcript();
     void DrawProgress(size_t index);
     void ModelSettings();
+    void OptionalSteps();
+    Settings JobSettings() const;
     void Timeline(float height);
     void Queue(size_t);
     void Seek(double);
+    void TogglePlayback();
     void Export(size_t index, const std::filesystem::path&, bool json);
     void OpenDialog(int action);
     std::filesystem::path ExpectedAligner() const;
@@ -188,9 +204,12 @@ private:
     AudioDevice device_;
     std::vector<Clip> clips_;
     std::array<Settings, 4> options_;
+    OptionalModel aligner_;
+    OptionalModel diarizer_{false, "artifacts/nemotron-diarization/onnx-bf16"};
     bool open_model_settings_ = false;
     int selected_ = -1, model_ = 0, view_ = 0;
     float timeline_zoom_ = 1, timeline_start_ = 0;
+    float timeline_height_ = 210;
     std::vector<float> timing_offsets_;
     float timing_font_size_ = 0;
     bool follow_playhead_ = true, audio_was_playing_ = false;

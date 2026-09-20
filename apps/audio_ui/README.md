@@ -38,7 +38,14 @@ out/build/windows-x64/bin/Release/din_audio_ui.exe assets/sample.wav
 ```
 
 Choose an exported model folder, import audio, then use **Transcribe selected**.
-The model stays loaded on one worker across files.
+Models load only after **Transcribe selected** is pressed and stay cached across files.
+After the transcription model loads, one background worker prepares the enabled
+aligner, then diarizer, while transcription runs. Their preparation status appears
+separately from inference progress. Model execution stays sequential; preparation
+can still compete for CPU/GPU memory and compute during a cold start.
+RTF includes transcription, alignment and diarization execution, excluding only
+initial setup and time actually spent waiting for optional model preparation.
+Overlapped loading is not subtracted from processing time.
 Changing settings affects subsequently submitted jobs; queued jobs retain their
 own settings. Imports and inference are serialized on this worker.
 
@@ -60,6 +67,8 @@ it does not validate inference SDK compatibility or model accuracy there.
 ## Current behavior
 
 - WAV, MP3 and FLAC are decoded to mono float audio at 16 kHz on the worker.
+  The UI and CLI models share `din_audio`, a small miniaudio-backed loader with
+  no inference or windowing dependencies. Device playback stays in the UI.
   The prototype holds decoded files in memory; large libraries need sufficient RAM.
 - Transcribe one selected file at a time, with success/error states per file. Retry by
   selecting a failed item and transcribing again. Existing results are retained
@@ -87,13 +96,16 @@ it does not validate inference SDK compatibility or model accuracy there.
   appear only when the actual result contains timestamps. Token durations are
   not presented as subtitle or word boundaries. Nemotron's absent end times stay
   absent in the display and JSON.
-- Every model offers **Settings > Qwen forced aligner** for word timestamps,
-  including Whisper, Parakeet TDT and Nemotron. Select the exported aligner
-  folder; selections are saved separately per model and apply to new jobs.
-  **Use detected aligner** also offers the aligner configured for Qwen.
-  A bundled `<model folder>/aligner` is used automatically when present.
-  Without an aligner, native timing is retained, including Whisper segments.
-  The aligner uses TensorRT RTX independently of the transcription provider and
+- **Optional processing > Forced alignment** is always visible beneath the
+  transcription controls. Enable it and choose a Qwen3 aligner export to add word
+  timestamps with any ASR model. Its folder and enable switch are saved independently
+  of the transcription model. The model and execution-provider dropdowns currently
+  offer Qwen3 aligner with CPU (FP32 export) or TensorRT RTX execution.
+  Switching it off retains the folder and keeps native
+  timing, including Whisper segments. A bundled aligner is suggested when enabling
+  the step, but never runs while the step is off. Existing per-model preferences
+  migrate from the selected ASR model. Changes apply only to newly submitted jobs.
+  The aligner selects its provider independently of the transcription provider and
   uses the native aligner's supported languages. Whisper passes its detected
   language; RNNT models use the configured language, with English for `auto`.
   Whisper transcribes the full recording once, preserving its long-form context.
@@ -103,6 +115,24 @@ it does not validate inference SDK compatibility or model accuracy there.
   warning also included in JSON. Qwen's integrated alignment remains in its native
   pipeline; if it fails, the UI retries Qwen transcription without alignment.
   Re-transcribe an existing result to obtain word timing.
+  Optional models have separate enable/selection state, with a snapshot per job.
+  Future VAD steps can sit alongside alignment and diarization without adding them
+  to each ASR model's settings; no generic pipeline framework is required yet.
+- **Optional processing > Diarization** enables Nemotron 3 speaker detection,
+  with its own model folder and CPU (FP32 export) / TensorRT RTX provider. Both
+  optional models are cached independently and run on the background worker.
+  Diarization failure retains the transcript and timing with a warning. Its runtime
+  is included in final RTF; loading/compilation remain separate setup time.
+- Diarized results open in **Speakers** view. Colors identify speakers in that view,
+  timing rows and timeline; thin activity lanes retain overlapping speech. A timed
+  span receives the speaker with greatest cumulative overlap, or remains unassigned.
+  Segment timestamps produce coarse labels; enable alignment for word-level labels.
+  Untimed transcripts remain readable, with speaker activity in the timeline.
+  **Rename speakers...** edits names for the current recording without rerunning
+  inference. Names appear in speaker-view copy and TXT/JSON exports. TXT groups the
+  model's timed text by speaker; Reading view and JSON's `text` keep the original
+  transcript. JSON also retains stable speaker IDs and overlapping activity spans.
+  Names stay with the current session/export; audio sessions are not project files.
 
 - The text timeline displays actual word/token spans or start markers. Click
   a span/marker to seek, use the ruler to seek anywhere, or zoom and pan. Full

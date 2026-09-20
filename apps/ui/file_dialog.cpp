@@ -53,7 +53,7 @@ void WindowsDialog(HWND owner, int action, const std::filesystem::path& location
     } apartment;
     const int kind = action % 8;
     const bool save = kind == 3 || kind == 4;
-    const bool folder = kind == 2 || kind == 6;
+    const bool folder = kind == 2 || kind == 6 || kind == 7;
     ComPtr<IFileDialog> dialog;
     Check(CoCreateInstance(save ? CLSID_FileSaveDialog : CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER,
                            IID_PPV_ARGS(dialog.GetAddressOf())));
@@ -71,6 +71,7 @@ void WindowsDialog(HWND owner, int action, const std::filesystem::path& location
                            : kind == 1 ? L"Import audio"
                            : kind == 2 ? L"Select model folder"
                            : kind == 6 ? L"Select forced aligner folder"
+                           : kind == 7 ? L"Select diarization model folder"
                                        : L"Export transcript"));
     if (!folder)
     {
@@ -166,7 +167,7 @@ void VerifyFileDialogs(const std::filesystem::path& existing_file)
     if (DialogFolder(existing_file) != directory || DialogFolder(existing_file / "missing" / "nested") != directory)
         throw std::runtime_error("Dialog folder fallback failed");
 #ifdef _WIN32
-    for (int action : {1, 2, 6, 3, 4})
+    for (int action : {1, 2, 6, 7, 3, 4})
         WindowsDialog(nullptr, action, existing_file, true);
 #endif
 }
@@ -215,7 +216,7 @@ void FileDialogs::Open(void* window, int action, const std::filesystem::path& lo
         SDL_ShowOpenFileDialog(FileChosen, data, w, video, 1, initial.c_str(), true);
     else if (kind == 1)
         SDL_ShowOpenFileDialog(FileChosen, data, w, audio, 1, initial.c_str(), true);
-    else if (kind == 2 || kind == 6)
+    else if (kind == 2 || kind == 6 || kind == 7)
         SDL_ShowOpenFolderDialog(FileChosen, data, w, initial.c_str(), false);
     else
         SDL_ShowSaveFileDialog(FileChosen, data, w, kind == 3 ? text : json, 1, initial.c_str());

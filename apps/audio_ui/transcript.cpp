@@ -6,6 +6,42 @@
 #include <stdexcept>
 namespace din::studio
 {
+std::string SpeakerName(const Result& result, int speaker)
+{
+    if (speaker < 0)
+        return "Unassigned";
+    const auto found = result.speakers.find(speaker);
+    return found != result.speakers.end() && !found->second.empty() ? found->second
+                                                                    : "Speaker " + std::to_string(speaker + 1);
+}
+void BuildSpeakerTurns(Result& result)
+{
+    result.speaker_turns.clear();
+    for (const auto& timing : result.timings)
+    {
+        if (result.speaker_turns.empty() || result.speaker_turns.back().speaker != timing.speaker)
+            result.speaker_turns.push_back(timing);
+        else
+        {
+            auto& turn = result.speaker_turns.back();
+            turn.text += " " + timing.text;
+            turn.end = timing.end;
+        }
+    }
+}
+std::string SpeakerText(const Result& result)
+{
+    if (result.speakers.empty() || result.speaker_turns.empty())
+        return result.text;
+    std::string text;
+    for (const auto& turn : result.speaker_turns)
+    {
+        if (!text.empty())
+            text += "\n\n";
+        text += SpeakerName(result, turn.speaker) + ": " + turn.text;
+    }
+    return text;
+}
 void AlignTranscript(Result& result, const din::io::Audio& audio, const std::vector<Timing>& spans,
                      const AlignFunction& align)
 {

@@ -1,6 +1,6 @@
 # Qwen3 ASR and forced alignment
 
-Offline C++ inference with TensorRT RTX in BF16 (default), FP16 or FP32, with optional FP8 decoder quantization.
+Offline C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; TensorRT RTX supports BF16 (default), FP16, FP32 and optional FP8 decoder quantization.
 
 ## Supported models
 
@@ -121,6 +121,9 @@ out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --aligner-dir D:\model
 Multi-configuration builds add the configuration (for example, `Release`) under `bin`.
 `--transcript` loads only the aligner and accepts text from any ASR model or a
 supplied transcript. C++ callers can use `Qwen3ForcedAligner::Align` or `AlignFile`.
+Standalone alignment uses `forced_aligner.h` and `ForcedAlignerConfig`; it loads no ASR decoder.
+`--provider cpu|trt-rtx` selects execution (default: `trt-rtx`);
+`--aligner-provider` optionally overrides it for alignment. C++ configs expose the same choices.
 
 Reuse pipeline/aligner instances; calls on one instance are synchronous.
 Set `Qwen3Config::progress` for audio loading, model loading/compilation, ASR chunk

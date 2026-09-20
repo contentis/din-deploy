@@ -20,6 +20,15 @@ namespace din::studio
 {
 namespace
 {
+ImVec4 SpeakerColor(int speaker, float alpha = 1.f)
+{
+    constexpr ImVec4 colors[] = {{.52f, .72f, 1.f, 1},  {.98f, .67f, .40f, 1}, {.48f, .84f, .65f, 1},
+                                 {.82f, .64f, .98f, 1}, {.96f, .59f, .68f, 1}, {.47f, .83f, .87f, 1},
+                                 {.90f, .83f, .46f, 1}, {.77f, .77f, .87f, 1}};
+    auto color = speaker < 0 ? ImGui::GetStyleColorVec4(ImGuiCol_Text) : colors[speaker % 8];
+    color.w = alpha;
+    return color;
+}
 const char* StageName(din::common::ProgressStage stage)
 {
     switch (stage)
@@ -34,6 +43,8 @@ const char* StageName(din::common::ProgressStage stage)
         return "Transcribing";
     case din::common::ProgressStage::Aligning:
         return "Aligning words";
+    case din::common::ProgressStage::Diarizing:
+        return "Identifying speakers";
     }
     return "Processing";
 }
@@ -111,11 +122,10 @@ void Workbench::DialogResult(int action, const std::string& path)
             auto& option = options_.at(static_cast<size_t>(action / 8));
             option.directory = path;
         }
+        else if (action % 8 == 7)
+            diarizer_.directory = path;
         else if (action % 8 == 6)
-        {
-            auto& option = options_.at(static_cast<size_t>(action / 8));
-            option.aligner_directory = path;
-        }
+            aligner_.directory = path;
         else
         {
             const auto index = static_cast<size_t>(action / 8);
@@ -128,28 +138,66 @@ void Workbench::DialogResult(int action, const std::string& path)
         error_ = e.what();
     }
 }
+Settings Workbench::JobSettings() const
+{
+    auto settings = options_[model_];
+    settings.model = model_;
+    if (aligner_.enabled && aligner_.directory.empty())
+        throw std::runtime_error("Choose a forced aligner model or switch off the alignment step.");
+    settings.aligner_directory = aligner_.enabled ? aligner_.directory : "";
+    if (settings.language.empty())
+        settings.language = "auto";
+    settings.aligner_provider = aligner_.provider;
+    if (diarizer_.enabled && diarizer_.directory.empty())
+        throw std::runtime_error("Choose a diarization model or switch off the diarization step.");
+    settings.diarizer_directory = diarizer_.enabled ? diarizer_.directory : "";
+    settings.diarizer_provider = diarizer_.provider;
+    return settings;
+}
 void Workbench::Queue(size_t index)
 {
     auto& clip = clips_[index];
     if (!clip.audio || clip.Pending())
         return;
-    auto settings = options_[model_];
-    settings.model = model_;
-    if (settings.language.empty())
-        settings.language = "auto";
-    if (model_ == 0)
-        settings.provider = "trt-rtx";
-
+    auto settings = JobSettings();
     clip.state = ClipState::Queued;
     worker_.Transcribe(index, clip.audio, std::move(settings));
 }
 void Workbench::Seek(double seconds)
 {
-    position_ = seconds;
+    if (selected_ < 0 || !clips_[selected_].audio)
+        return;
+    position_ = std::clamp(seconds, 0., clips_[selected_].audio->Duration());
+    audio_was_playing_ = false;
     try
     {
         if (device_.Playing() && selected_ >= 0)
-            device_.Seek(seconds);
+            device_.Seek(position_);
+    }
+    catch (const std::exception& e)
+    {
+        error_ = e.what();
+    }
+}
+void Workbench::TogglePlayback()
+{
+    if (selected_ < 0 || !clips_[selected_].audio)
+        return;
+    try
+    {
+        if (device_.Playing())
+        {
+            device_.Pause();
+            position_ = device_.Position();
+        }
+        else
+        {
+            const auto& audio = clips_[selected_].audio;
+            if (position_ >= audio->Duration())
+                position_ = 0;
+            device_.Play(audio, position_);
+        }
+        audio_was_playing_ = device_.Playing();
     }
     catch (const std::exception& e)
     {
@@ -241,26 +289,7 @@ void Workbench::Player()
     if (ImGui::IsItemActive())
         Seek(std::clamp(double(ImGui::GetIO().MousePos.x - origin.x) / width, 0., 1.) * clip.audio->Duration());
     if (ImGui::Button(device_.Playing() ? "Pause" : "Play", ImVec2(ImGui::GetFontSize() * 5, 0)))
-    {
-        try
-        {
-            if (device_.Playing())
-            {
-                position_ = device_.Position();
-                device_.Pause();
-            }
-            else
-            {
-                if (position_ >= clip.audio->Duration())
-                    position_ = 0;
-                device_.Play(clip.audio, position_);
-            }
-        }
-        catch (const std::exception& e)
-        {
-            error_ = e.what();
-        }
-    }
+        TogglePlayback();
     ImGui::SameLine();
     ImGui::AlignTextToFramePadding();
     ImGui::Text("%.1f / %.1f s", position_, clip.audio->Duration());
@@ -292,15 +321,19 @@ void Workbench::DrawProgress(size_t index)
     ImGui::Text("%s  /  %.1f s", StageName(p.event.stage), elapsed);
     ImGui::PushTextWrapPos(0);
     ImGui::TextDisabled("%s", p.event.detail.c_str());
+    const char* steps[] = {"Alignment", "Diarization"};
+    for (size_t step = 0; step < p.preparation.size(); ++step)
+        if (!p.preparation[step].empty())
+            ImGui::TextDisabled("%s: %s", steps[step], p.preparation[step].c_str());
     ImGui::PopTextWrapPos();
-    const bool measured = running && p.event.completed_audio_seconds > 0 && p.event.total_audio_seconds > 0;
+    const bool measured = p.event.completed_audio_seconds > 0 && p.event.total_audio_seconds > 0;
     if (measured)
     {
         const float fraction =
             static_cast<float>(std::clamp(p.event.completed_audio_seconds / p.event.total_audio_seconds, 0., 1.));
         ImGui::ProgressBar(fraction, ImVec2(-1, 6), "");
         ImGui::Text("%.1f / %.1f s audio", p.event.completed_audio_seconds, p.event.total_audio_seconds);
-        if (p.measured_seconds > 0)
+        if (running && p.measured_seconds > 0)
             ImGui::Text("%.2fx real time  /  RTF %.3f", p.event.completed_audio_seconds / p.measured_seconds,
                         p.measured_seconds / p.event.completed_audio_seconds);
         ImGui::TextDisabled("Measured at last completed chunk");
@@ -320,8 +353,8 @@ void Workbench::Transcript()
         ImGui::TextDisabled("Transcripts will appear here.");
         return;
     }
-    const auto& clip = clips_[selected_];
-    const auto& result = clip.result;
+    auto& clip = clips_[selected_];
+    auto& result = clip.result;
     if (clip.Pending())
         DrawProgress(static_cast<size_t>(selected_));
     if (!result.warning.empty())
@@ -341,17 +374,19 @@ void Workbench::Transcript()
     if (result.setup_seconds >= .01)
         ImGui::TextDisabled("Model setup %.2f s", result.setup_seconds);
     ImGui::Spacing();
-    if (!result.timings.empty())
+    if (!result.timings.empty() || !result.speakers.empty())
     {
         const char* timing_label = result.timing_kind == "word"      ? "Word timing"
                                    : result.timing_kind == "segment" ? "Segment timing"
                                                                      : "Token timing";
-        const char* options[] = {"Reading", timing_label};
+        const char* options[] = {"Reading", timing_label, "Speakers"};
         ImGui::SetNextItemWidth(160);
-        ImGui::Combo("##view", &view_, options, 2);
+        if (result.speakers.empty() && view_ == 2)
+            view_ = 0;
+        ImGui::Combo("##view", &view_, options, result.speakers.empty() ? 2 : 3);
     }
     if (ImGui::Button("Copy text"))
-        ImGui::SetClipboardText(result.text.c_str());
+        ImGui::SetClipboardText((view_ == 2 ? SpeakerText(result) : result.text).c_str());
     ImGui::SameLine();
     if (ImGui::Button("Export..."))
         ImGui::OpenPopup("Export transcript");
@@ -363,9 +398,59 @@ void Workbench::Transcript()
             OpenDialog(selected_ * 8 + 4);
         ImGui::EndPopup();
     }
-    ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * .5f));
-    if (view_ == 0 || result.timings.empty())
+    if (!result.speakers.empty())
     {
+        ImGui::SameLine();
+        if (ImGui::Button("Rename speakers..."))
+            ImGui::OpenPopup("Rename speakers");
+        if (ImGui::BeginPopup("Rename speakers"))
+        {
+            ImGui::TextDisabled("Names apply to this recording and its exports.");
+            for (auto& [id, name] : result.speakers)
+            {
+                ImGui::PushID(id);
+                ImGui::ColorButton("##color", SpeakerColor(id), ImGuiColorEditFlags_NoTooltip, ImVec2(18, 18));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(220);
+                const auto hint = "Speaker " + std::to_string(id + 1);
+                ImGui::InputTextWithHint("##name", hint.c_str(), &name);
+                ImGui::PopID();
+            }
+            ImGui::EndPopup();
+        }
+    }
+    ImGui::Dummy(ImVec2(0, ImGui::GetFontSize() * .5f));
+    if (view_ == 2 && !result.speaker_turns.empty())
+    {
+        if (result.timing_kind != "word")
+        {
+            ImGui::TextDisabled("Speaker labels follow %s timing", result.timing_kind.c_str());
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("Enable forced alignment for word-level speaker attribution.");
+        }
+        for (const auto& turn : result.speaker_turns)
+        {
+            ImGui::BeginGroup();
+            ImGui::PushStyleColor(ImGuiCol_Text, SpeakerColor(turn.speaker));
+            ImGui::Text("%s  /  %.2f s", SpeakerName(result, turn.speaker).c_str(), turn.start);
+            ImGui::TextWrapped("%s", turn.text.c_str());
+            ImGui::PopStyleColor();
+            ImGui::EndGroup();
+            if (ImGui::IsItemHovered())
+            {
+                ImGui::SetMouseCursor(ImGuiMouseCursor_Hand);
+                ImGui::SetTooltip("Jump to %.2f s", turn.start);
+            }
+            if (ImGui::IsItemClicked())
+                Seek(turn.start);
+            ImGui::Spacing();
+        }
+    }
+    else if (view_ == 0 || result.timings.empty())
+    {
+        if (view_ == 2 && !result.speakers.empty())
+            ImGui::TextWrapped("Speakers detected. Enable forced alignment to label untimed text; speaker activity is "
+                               "visible in the timeline.");
         ImGui::PushFont(nullptr, ImGui::GetFontSize() * 1.25f);
         ImGui::PushTextWrapPos(0);
         ImGui::TextUnformatted(result.text.empty() ? "(No speech recognized)" : result.text.c_str());
@@ -385,10 +470,15 @@ void Workbench::Transcript()
                 label << std::fixed << std::setprecision(2) << t.start;
                 if (t.end)
                     label << " - " << *t.end;
-                label << " s   " << t.text;
+                label << " s   ";
+                if (!result.speakers.empty())
+                    label << SpeakerName(result, t.speaker) << "  /  ";
+                label << t.text;
+                ImGui::PushStyleColor(ImGuiCol_Text, SpeakerColor(t.speaker));
                 if (ImGui::Selectable(label.str().c_str(),
                                       position_ >= t.start && position_ < t.end.value_or(t.start + .15)))
                     Seek(t.start);
+                ImGui::PopStyleColor();
                 ImGui::PopID();
             }
     }
@@ -411,13 +501,22 @@ void Workbench::Export(size_t index, const std::filesystem::path& path, bool jso
                                    {"timing_kind", r.timing_kind},
                                    {"timings", nlohmann::json::array()}};
         for (const auto& t : r.timings)
-            document["timings"].push_back({{"text", t.text},
-                                           {"start", t.start},
-                                           {"end", t.end ? nlohmann::json(*t.end) : nlohmann::json(nullptr)}});
+            document["timings"].push_back(
+                {{"text", t.text},
+                 {"start", t.start},
+                 {"end", t.end ? nlohmann::json(*t.end) : nlohmann::json(nullptr)},
+                 {"speaker", t.speaker < 0 ? nlohmann::json(nullptr) : nlohmann::json(t.speaker)}});
+        document["speakers"] = nlohmann::json::array();
+        for (const auto& [id, name] : r.speakers)
+            document["speakers"].push_back({{"id", id}, {"name", SpeakerName(r, id)}});
+        document["speaker_activity"] = nlohmann::json::array();
+        for (const auto& activity : r.speaker_activity)
+            document["speaker_activity"].push_back(
+                {{"speaker", activity.speaker}, {"start", activity.start}, {"end", *activity.end}});
         text = document.dump(2);
     }
     else
-        text = c.result.text;
+        text = SpeakerText(c.result);
     text += '\n';
     WriteFileAtomically(path, text);
     export_directory_ = std::filesystem::absolute(path).parent_path();
@@ -461,13 +560,15 @@ void Workbench::Timeline(float height)
     const float width = std::max(1.f, ImGui::GetContentRegionAvail().x);
     const float lane_top = ImGui::GetTextLineHeight() + 9;
     const float lane_height = ImGui::GetTextLineHeight() + 10;
-    ImGui::InvisibleButton("##timecanvas", ImVec2(width, lane_top + lane_height));
+    const float activity_height = static_cast<float>(clip.result.speakers.size()) * 7;
+    const float canvas_height = lane_top + lane_height + activity_height;
+    ImGui::InvisibleButton("##timecanvas", ImVec2(width, canvas_height));
     auto* draw = ImGui::GetWindowDrawList();
     auto x_at = [&](double seconds)
     {
         return origin.x + static_cast<float>((seconds - timeline_start_) / span) * width;
     };
-    draw->PushClipRect(origin, ImVec2(origin.x + width, origin.y + lane_top + lane_height), true);
+    draw->PushClipRect(origin, ImVec2(origin.x + width, origin.y + canvas_height), true);
     draw->AddRectFilled(ImVec2(origin.x, origin.y + lane_top),
                         ImVec2(origin.x + width, origin.y + lane_top + lane_height),
                         ImGui::GetColorU32(ImGuiCol_FrameBg), 4);
@@ -491,7 +592,9 @@ void Workbench::Timeline(float height)
         const bool active = t.end && position_ >= t.start && position_ < *t.end;
         draw->AddRectFilled(ImVec2(x, origin.y + lane_top + 2),
                             ImVec2(std::max(x + 2, end - 1), origin.y + lane_top + lane_height - 2),
-                            ImGui::GetColorU32(active ? ImGuiCol_HeaderActive : ImGuiCol_Header), 3);
+                            t.speaker < 0 ? ImGui::GetColorU32(active ? ImGuiCol_HeaderActive : ImGuiCol_Header)
+                                          : ImGui::GetColorU32(SpeakerColor(t.speaker, active ? .7f : .3f)),
+                            3);
         if (!t.end)
             draw->AddLine(ImVec2(x, origin.y + lane_top), ImVec2(x, origin.y + lane_top + lane_height),
                           ImGui::GetColorU32(ImGuiCol_SliderGrab), 2);
@@ -506,6 +609,18 @@ void Workbench::Timeline(float height)
             mouse.x <= std::max(x + 4, end))
             hovered = &t;
     }
+    for (const auto& activity : clip.result.speaker_activity)
+    {
+        const float x = x_at(activity.start), end = x_at(activity.end.value_or(activity.start));
+        if (end < origin.x || x > origin.x + width)
+            continue;
+        const auto row = std::distance(clip.result.speakers.begin(), clip.result.speakers.find(activity.speaker));
+        const float y = origin.y + lane_top + lane_height + static_cast<float>(row) * 7;
+        draw->AddRectFilled(ImVec2(x, y + 1), ImVec2(std::max(x + 1, end), y + 6),
+                            ImGui::GetColorU32(SpeakerColor(activity.speaker)), 2);
+        if (ImGui::IsItemHovered() && mouse.y >= y && mouse.y < y + 7 && mouse.x >= x && mouse.x <= end)
+            hovered = &activity;
+    }
     if (clip.result.timings.empty())
         draw->AddText(ImVec2(origin.x + 10, origin.y + lane_top + 7), ImGui::GetColorU32(ImGuiCol_TextDisabled),
                       clip.result.model.empty() ? "Timing appears after transcription, when available."
@@ -516,10 +631,13 @@ void Workbench::Timeline(float height)
     draw->PopClipRect();
     if (hovered)
     {
+        const auto label = clip.result.speakers.empty()
+                               ? hovered->text
+                               : SpeakerName(clip.result, hovered->speaker) + "\n" + hovered->text;
         if (hovered->end)
-            ImGui::SetTooltip("%s\n%.2f - %.2f s", hovered->text.c_str(), hovered->start, *hovered->end);
+            ImGui::SetTooltip("%s\n%.2f - %.2f s", label.c_str(), hovered->start, *hovered->end);
         else
-            ImGui::SetTooltip("%s\nStart: %.2f s", hovered->text.c_str(), hovered->start);
+            ImGui::SetTooltip("%s\nStart: %.2f s", label.c_str(), hovered->start);
     }
     if (ImGui::IsItemClicked())
         Seek(hovered ? hovered->start
@@ -572,11 +690,13 @@ void Workbench::Timeline(float height)
             ImGui::SetCursorPos({base.x + timing_offsets_[i], base.y});
             ImGui::PushID(static_cast<int>(i));
             const bool active = position_ >= t.start && (t.end ? position_ < *t.end : i == focus);
-            if (active)
+            if (t.speaker >= 0)
+                ImGui::PushStyleColor(ImGuiCol_Button, SpeakerColor(t.speaker, active ? .6f : .25f));
+            else if (active)
                 ImGui::PushStyleColor(ImGuiCol_Button, ImGui::GetStyleColorVec4(ImGuiCol_HeaderActive));
             if (ImGui::Button(t.text.empty() ? "(token)" : t.text.c_str()))
                 Seek(t.start);
-            if (active)
+            if (active || t.speaker >= 0)
                 ImGui::PopStyleColor();
             if (ImGui::IsItemHovered())
             {
@@ -615,6 +735,8 @@ void Workbench::Update()
         else
         {
             clip.result = std::move(c.result);
+            if (static_cast<int>(c.index) == selected_ && !clip.result.speakers.empty())
+                view_ = 2;
             timing_offsets_.clear();
             clip.state = ClipState::Complete;
         }
@@ -643,6 +765,9 @@ void Workbench::Draw()
     ImGui::PopFont();
     ImGui::EndGroup();
     ImGui::Dummy(ImVec2(0, 4 * unit));
+    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(10 * unit, 3 * unit));
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 4 * unit);
+    ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, ImVec2(6 * unit, 4 * unit));
     if (ImGui::BeginTable("Settings", 4, ImGuiTableFlags_NoSavedSettings | ImGuiTableFlags_NoPadOuterX))
     {
         ImGui::TableSetupColumn("Model", ImGuiTableColumnFlags_WidthFixed, 170 * unit);
@@ -650,7 +775,7 @@ void Workbench::Draw()
         ImGui::TableSetupColumn("Model folder", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Options", ImGuiTableColumnFlags_WidthFixed, 100 * unit);
         ImGui::TableNextRow();
-        for (const auto* label : {"Model", "Execution", "Model folder", "Options"})
+        for (const auto* label : {"Transcription", "Execution", "Model folder", "Options"})
         {
             ImGui::TableNextColumn();
             ImGui::TextDisabled("%s", label);
@@ -661,18 +786,10 @@ void Workbench::Draw()
         ImGui::Combo("##model", &model_, Models, 4);
         auto& option = options_[model_];
         ImGui::TableSetColumnIndex(1);
-        if (model_ == 0)
-        {
-            ImGui::AlignTextToFramePadding();
-            ImGui::TextUnformatted("TensorRT RTX");
-        }
-        else
-        {
-            ImGui::SetNextItemWidth(-1);
-            int provider = option.provider == "trt-rtx";
-            if (ImGui::Combo("##execution", &provider, "CPU\0TensorRT RTX\0"))
-                option.provider = provider ? "trt-rtx" : "cpu";
-        }
+        ImGui::SetNextItemWidth(-1);
+        int provider = option.provider == "trt-rtx";
+        if (ImGui::Combo("##execution", &provider, "CPU\0TensorRT RTX\0"))
+            option.provider = provider ? "trt-rtx" : "cpu";
         ImGui::TableSetColumnIndex(2);
         const float folder_width = ImGui::CalcTextSize("Browse...").x + 2 * ImGui::GetStyle().FramePadding.x;
         ImGui::SetNextItemWidth(
@@ -685,11 +802,15 @@ void Workbench::Draw()
         ModelSettings();
         ImGui::EndTable();
     }
+    OptionalSteps();
+    ImGui::PopStyleVar(3);
     ImGui::Dummy(ImVec2(0, 4 * unit));
     const bool has_audio = selected_ >= 0 && clips_[selected_].audio;
-    const float timeline_height = has_audio ? 190 * unit : 0;
-    const float height =
-        std::max(100.f, ImGui::GetContentRegionAvail().y - timeline_height - ImGui::GetStyle().ItemSpacing.y * 2);
+    const float divider_height = 6 * unit;
+    const float available = ImGui::GetContentRegionAvail().y - ImGui::GetStyle().ItemSpacing.y * 3 - divider_height;
+    const float max_timeline = std::max(100 * unit, available - 100 * unit);
+    const float timeline_height = has_audio ? std::clamp(timeline_height_ * unit, 100 * unit, max_timeline) : 0;
+    const float height = std::max(100 * unit, available - timeline_height);
     if (ImGui::BeginTable("Panels", 3, ImGuiTableFlags_Resizable | ImGuiTableFlags_NoPadOuterX))
     {
         ImGui::TableSetupColumn("Audio library", ImGuiTableColumnFlags_WidthFixed, 210 * unit);
@@ -726,7 +847,21 @@ void Workbench::Draw()
         ImGui::EndTable();
     }
     if (has_audio)
+    {
+        const auto origin = ImGui::GetCursorScreenPos();
+        const float width = ImGui::GetContentRegionAvail().x;
+        ImGui::InvisibleButton("Resize timeline", ImVec2(width, divider_height));
+        const bool active = ImGui::IsItemActive(), hovered = ImGui::IsItemHovered();
+        if (active || hovered)
+            ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeNS);
+        if (active)
+            timeline_height_ =
+                std::clamp(timeline_height - ImGui::GetIO().MouseDelta.y, 100 * unit, max_timeline) / unit;
+        ImGui::GetWindowDrawList()->AddLine(
+            ImVec2(origin.x, origin.y + divider_height / 2), ImVec2(origin.x + width, origin.y + divider_height / 2),
+            ImGui::GetColorU32(active || hovered ? ImGuiCol_SliderGrabActive : ImGuiCol_Border), 2 * unit);
         Timeline(timeline_height);
+    }
     SavePreferences();
     if (!error_.empty() && !ImGui::IsPopupOpen("Audio error"))
         ImGui::OpenPopup("Audio error");
@@ -741,6 +876,9 @@ void Workbench::Draw()
         }
         ImGui::EndPopup();
     }
+    if (ImGui::IsKeyPressed(ImGuiKey_Space, false) && !ImGui::GetIO().WantTextInput && !ImGui::IsAnyItemActive() &&
+        !dialogs_.Busy() && !ImGui::IsPopupOpen(nullptr, ImGuiPopupFlags_AnyPopupId | ImGuiPopupFlags_AnyPopupLevel))
+        TogglePlayback();
     ImGui::End();
 }
 }  // namespace din::studio

@@ -31,7 +31,7 @@ Preferences ReadPreferences(const std::filesystem::path& path)
             throw std::runtime_error("Invalid preferences file");
         result[key] = value;
     }
-    if (result["version"] != "1")
+    if (result["version"] != "1" && result["version"] != "2")
         throw std::runtime_error("Unsupported preferences version");
     return result;
 }

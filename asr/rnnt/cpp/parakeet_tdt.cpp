@@ -332,7 +332,7 @@ TranscriptionResult ParakeetPipeline::Transcribe(const Audio& audio)
 
 TranscriptionResult ParakeetPipeline::TranscribeFile(const fs::path& audio_path)
 {
-    const auto audio = din::io::LoadAudio(audio_path.string(), static_cast<int>(metadata_.sampling_rate));
+    const auto audio = din::io::LoadAudio(audio_path, static_cast<int>(metadata_.sampling_rate));
     return Transcribe(audio);
 }
 

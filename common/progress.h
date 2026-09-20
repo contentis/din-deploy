@@ -11,7 +11,8 @@ enum class ProgressStage
     LoadingModel,
     CompilingModel,
     Transcribing,
-    Aligning
+    Aligning,
+    Diarizing
 };
 struct InferenceProgress
 {

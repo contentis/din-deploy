@@ -18,7 +18,9 @@ int main(int argc, char** argv)
         argparse::ArgumentParser parser("din_asr_qwen3_cli");
         parser.add_description("Offline Qwen3 ASR and forced alignment.");
         parser.add_argument("audiofile");
+        parser.add_argument("--provider").default_value(config.provider).choices("cpu", "trt-rtx");
         parser.add_argument("--model-dir").default_value(config.model_dir.string());
+        parser.add_argument("--aligner-provider").default_value(std::string{}).choices("", "cpu", "trt-rtx");
         parser.add_argument("--aligner-dir").default_value(std::string{}).help("Exported forced aligner directory");
         parser.add_argument("--transcript")
             .default_value(std::string{})
@@ -36,7 +38,9 @@ int main(int argc, char** argv)
             .help(
                 "Chunk target: 0 = auto (1200 s ASR / 180 s aligned), limited by KV capacity; boundaries may add 5 s");
         parser.parse_args(argc, argv);
+        config.provider = parser.get<std::string>("--provider");
         config.model_dir = parser.get<std::string>("--model-dir");
+        config.aligner_provider = parser.get<std::string>("--aligner-provider");
         config.aligner_dir = parser.get<std::string>("--aligner-dir");
         config.lang_id = parser.get<std::string>("--lang-id");
         config.ep_cache_dir = parser.get<std::string>("--ep-cache");
@@ -60,7 +64,13 @@ int main(int argc, char** argv)
                 result.text.erase(0, 3);
             const auto audio = din::io::LoadAudio(parser.get<std::string>("audiofile"), 16000);
             result.language = config.lang_id == "auto" ? "English" : config.lang_id;
-            Qwen3ForcedAligner aligner(std::move(config));
+            ForcedAlignerConfig alignment;
+            alignment.provider = config.aligner_provider.empty() ? config.provider : config.aligner_provider;
+            if (!config.aligner_dir.empty())
+                alignment.model_dir = config.aligner_dir;
+            alignment.ep_cache_dir = config.ep_cache_dir;
+            alignment.ep_context_dir = config.ep_context_dir;
+            Qwen3ForcedAligner aligner(std::move(alignment));
             const auto start = std::chrono::steady_clock::now();
             result.timestamps = aligner.Align(audio, result.text, result.language);
             result.transcribe_seconds = std::chrono::duration<float>(std::chrono::steady_clock::now() - start).count();

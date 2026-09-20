@@ -54,7 +54,7 @@ int main(int argc, char** argv)
 {
     if (argc > 1 && std::string(argv[1]) == "--self-test")
         return din::studio::SelfTest();
-    if ((argc >= 5 && argc <= 7) &&
+    if ((argc >= 5 && argc <= 9) &&
         (std::string(argv[1]) == "--infer-check" || std::string(argv[1]) == "--alignment-check"))
     {
         try
@@ -64,8 +64,12 @@ int main(int argc, char** argv)
             settings.directory = argv[3];
             if (argc >= 6 && std::string(argv[5]) != "-")
                 settings.aligner_directory = argv[5];
-            if (argc == 7)
+            if (argc >= 7)
                 settings.provider = argv[6];
+            if (argc >= 8)
+                settings.diarizer_directory = argv[7];
+            if (argc >= 9)
+                settings.diarizer_provider = argv[8];
             const auto audio = din::studio::Decode(din::studio::Utf8Path(argv[4]));
             if (std::string(argv[1]) == "--alignment-check")
                 return din::studio::AlignmentCheck(settings, *audio);
@@ -74,6 +78,14 @@ int main(int argc, char** argv)
             std::cout << result.text << "\nTiming entries: " << result.timings.size() << '\n';
             if (!result.warning.empty())
                 std::cout << "Warning: " << result.warning << '\n';
+            if (!settings.diarizer_directory.empty())
+            {
+                if (result.speakers.empty())
+                    throw std::runtime_error("Diarization check needs a speech recording with detected speakers");
+                std::cout << "Speakers: " << result.speakers.size()
+                          << " / activity intervals: " << result.speaker_activity.size() << '\n';
+                std::cout << din::studio::SpeakerText(result) << '\n';
+            }
             if (!settings.aligner_directory.empty() && (result.timing_kind != "word" || result.timings.empty()))
                 throw std::runtime_error("Forced alignment did not return word timing");
             for (const auto& timing : result.timings)
@@ -94,7 +106,8 @@ int main(int argc, char** argv)
     const bool smoke_whisper = (argc == 4 || argc == 5) && std::string(argv[1]) == "--smoke-whisper";
     const bool smoke_asr = smoke_whisper || ((argc == 4 || argc == 5) && std::string(argv[1]) == "--smoke-asr");
     const bool smoke_settings = argc == 3 && std::string(argv[1]) == "--smoke-settings";
-    bool smoke = smoke_asr || smoke_settings || (argc > 1 && std::string(argv[1]) == "--smoke-test");
+    const bool smoke_speakers = argc > 1 && std::string(argv[1]) == "--smoke-speakers";
+    bool smoke = smoke_asr || smoke_settings || smoke_speakers || (argc > 1 && std::string(argv[1]) == "--smoke-test");
     if (!SDL_Init(SDL_INIT_VIDEO))
     {
         std::cerr << SDL_GetError();
@@ -138,6 +151,8 @@ int main(int argc, char** argv)
     int exit_code = 0;
     {
         din::studio::Workbench app(window, !smoke);
+        if (smoke_speakers)
+            app.ShowSpeakerDemo();
         if (smoke_settings)
             app.ShowModelSettings(std::atoi(argv[2]));
         if (smoke_asr)

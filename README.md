@@ -21,6 +21,7 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 | NVIDIA Nemotron 3.5 ASR Streaming 0.6B | `nvidia/nemotron-3.5-asr-streaming-0.6b` | [RNNT](asr/rnnt/README.md) |
 | Qwen3 ASR | `Qwen/Qwen3-ASR-0.6B-hf`<br>`Qwen/Qwen3-ASR-1.7B-hf` | [Qwen3](asr/qwen3/README.md) |
 | Qwen3 Forced Aligner | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | [Qwen3](asr/qwen3/README.md) |
+| NVIDIA Nemotron 3 Diarization (preview) | `nvidia/Nemotron-3-Diarization-preview` | [Diarization](asr/diarization/README.md) |
 
 ### Computer Vision
 

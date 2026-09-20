@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: Apache-2.0
-#define MINIAUDIO_IMPLEMENTATION
 #include <algorithm>
 #include <cmath>
 #include <cstring>
@@ -21,38 +20,7 @@ void Check(ma_result result, const char* action)
 }  // namespace
 std::shared_ptr<Audio> Decode(const std::filesystem::path& path)
 {
-    ma_decoder decoder;
-    auto config = ma_decoder_config_init(ma_format_f32, 1, 16000);
-#ifdef _WIN32
-    Check(ma_decoder_init_file_w(path.c_str(), &config, &decoder), "Open audio");
-#else
-    Check(ma_decoder_init_file(path.c_str(), &config, &decoder), "Open audio");
-#endif
-    struct Guard
-    {
-        ma_decoder* p;
-        ~Guard()
-        {
-            ma_decoder_uninit(p);
-        }
-    } guard{&decoder};
-    auto audio = std::make_shared<Audio>();
-    audio->sample_rate = 16000;
-    float block[16384];
-    for (;;)
-    {
-        ma_uint64 count = 0;
-        const auto status = ma_decoder_read_pcm_frames(&decoder, block, 16384, &count);
-        if (status != MA_SUCCESS && status != MA_AT_END)
-            Check(status, "Decode audio");
-        audio->samples.insert(audio->samples.end(), block, block + count);
-        if (status == MA_AT_END || count == 0)
-            break;
-        Check(status, "Decode audio");
-    }
-    if (audio->samples.empty())
-        throw std::runtime_error("The audio file contains no samples");
-    return audio;
+    return std::make_shared<Audio>(din::io::LoadAudio(path, 16000));
 }
 std::vector<float> Peaks(const Audio& audio)
 {
