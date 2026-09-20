@@ -100,6 +100,11 @@ The built executable and required runtime libraries are placed under `out/build/
 
 ## Usage
 
+An optional [ImGui audio workbench](apps/audio_ui/README.md) provides audio import,
+playback, model settings, text timing and queued ASR. Enable `DIN_BUILD_AUDIO_UI=ON` and
+build `din_audio_ui`. It uses SDL3/Vulkan on Windows and Linux, targeting x64 and
+ARM64; a standalone audio-shell build is available without inference SDKs.
+
 Run the desired `din_*_cli` executable from the build directory with the model directory and arguments described in its sample README. Each CLI also documents its options through `--help`.
 
 For an introductory native ONNX integration example, build and run `din_base_onnx`, which uses ResNet-18.

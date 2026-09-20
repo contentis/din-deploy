@@ -1,0 +1,43 @@
+name: Audio UI portability
+on:
+  pull_request:
+    paths: ['apps/audio_ui/**', 'apps/ui/**', 'asr/**', 'common/**', 'CMakeLists.txt', 'cmake/**', '.github/workflows/audio-ui.yml']
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  audio-shell:
+    name: Audio shell / ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm, windows-2025, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - name: Linux desktop dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build pkg-config libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev libxtst-dev libasound2-dev libpulse-dev libwayland-dev libxkbcommon-dev libdecor-0-dev libvulkan-dev mesa-vulkan-drivers xvfb
+      - name: Configure Linux
+        if: runner.os == 'Linux'
+        run: cmake -S apps/audio_ui -B build-audio -G Ninja -DCMAKE_BUILD_TYPE=Release
+      - name: Configure Windows
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $target = if ('${{ runner.arch }}' -eq 'ARM64') { 'ARM64' } else { 'x64' }
+          cmake -S apps/audio_ui -B build-audio -A $target
+      - name: Build
+        run: cmake --build build-audio --config Release --target din_audio_ui --parallel 4
+      - name: Audio and worker contracts
+        run: ctest --test-dir build-audio -C Release --output-on-failure
+      - name: Linux UI smoke
+        if: runner.os == 'Linux'
+        working-directory: build-audio
+        run: xvfb-run -a ./din_audio_ui --smoke-test
+      - name: Windows UI smoke
+        if: runner.os == 'Windows'
+        working-directory: build-audio
+        run: ./Release/din_audio_ui.exe --smoke-test

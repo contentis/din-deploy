@@ -226,6 +226,7 @@ NemotronPipeline::NemotronPipeline(NemotronConfig config)
 
     din::common::EpContextOptions ep_context;
     ep_context.output_dir = config_.ep_context_dir.string();
+    ep_context.progress = config_.progress;
 
     din::common::ModelProfile preprocessor_profile;
     {

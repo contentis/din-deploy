@@ -106,6 +106,7 @@ struct WhisperConfig
     bool disable_cuda_sampling = false;
     bool condition_on_previous_text = true;
     int prefill_block_size = 128;  // 0 disables buckets; legacy static graphs use sequential prefill.
+    din::common::ProgressCallback progress;
 };
 
 class WhisperPipeline

@@ -78,6 +78,16 @@ For components supplied through an SDK or binary package, the corresponding vend
 - `transformers`: Apache-2.0
 - `wheel`: MIT
 
+## Optional audio UI dependencies
+
+- Dear ImGui 1.92.5 docking, commit `3912b3d9a9c1b3f17431aebafd86d2f40ee6e59c`:
+  MIT, copyright Omar Cornut. [License](https://github.com/ocornut/imgui/blob/v1.92.5-docking/LICENSE.txt).
+- SDL 3.2.28, commit `7f3ae3d57459e59943a4ecfefc8f6277ec6bf540`:
+  zlib, copyright Sam Lantinga. [License](https://github.com/libsdl-org/SDL/blob/release-3.2.28/LICENSE.txt).
+- miniaudio 0.11.23, commit `f40cf03f80cdb7e741d43e53b7e706e8c1394bcf`:
+  used under its MIT license option, copyright David Reid.
+  [License](https://github.com/mackron/miniaudio/blob/0.11.23/LICENSE).
+
 ## Model/Artifact
 
 - `black-forest-labs/FLUX.2-klein-4b`: Apache-2.0

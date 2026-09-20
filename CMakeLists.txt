@@ -103,6 +103,12 @@ add_subdirectory(vision/sam2)
 add_subdirectory(asr/whisper)
 add_subdirectory(asr/qwen3)
 
+option(DIN_BUILD_AUDIO_UI "Build the cross-platform ImGui audio workbench" OFF)
+if(DIN_BUILD_AUDIO_UI)
+    add_subdirectory(apps/ui)
+    add_subdirectory(apps/audio_ui)
+endif()
+
 if(DIN_BUILD_TESTING)
     set(_din_cli_test_audio "${DIN_DEPLOY_ARTIFACTS_ROOT}/audio/de/schakaleundaraber_elli.mp3")
 
