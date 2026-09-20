@@ -1,0 +1,11 @@
+# Install alongside the repository requirements and a CUDA-enabled PyTorch build.
+transformers>=5.13,<5.14
+torch>=2.11
+onnx>=1.20
+onnxscript
+onnxruntime>=1.27
+onnxruntime-ep-nv-tensorrt-rtx
+av>=18
+Pillow
+numpy
+filelock

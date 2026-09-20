@@ -27,6 +27,7 @@ DIN Deploy is a collection of practical samples for exporting and running local 
 | Model     | Hugging Face ID                                                                                                                         | Docs                          |
 |-----------|-----------------------------------------------------------------------------------------------------------------------------------------|-------------------------------|
 | Meta Sam2 | `facebook/sam2.1-hiera-tiny`<br>`facebook/sam2.1-hiera-small`<br>`facebook/sam2.1-hiera-base-plus`<br>`facebook/sam2.1-hiera-large`<br> | [Sam2](vision/sam2/README.md) |
+| Qwen3-VL (initial Python implementation) | `Qwen/Qwen3-VL-2B-Instruct`<br>`Qwen/Qwen3-VL-8B-Instruct` | [Qwen3-VL](vision/qwen3_vl/README.md) |
 
 ## Performance benchmarks
 

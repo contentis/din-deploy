@@ -1,0 +1,139 @@
+diff --git a/src/tensorrt_rtx_execution_provider.cc b/src/tensorrt_rtx_execution_provider.cc
+index cea72d0..6ff11e0 100644
+--- a/src/tensorrt_rtx_execution_provider.cc
++++ b/src/tensorrt_rtx_execution_provider.cc
+@@ -5315,6 +5315,84 @@ static bool IsIOBindingRequired(TRTState* const trt_state, OrtKernelContext* ctx
+     return require_io_binding;
+ }
+ 
++// Retain captures across shape changes without another ICudaEngine/weight allocation.
++// Opt-in through persistent workspace; the provider lock and single external stream
++// serialize all contexts that share that workspace. New shapes beyond the bounded
++// cache use the active context normally (and may recapture).
++static OrtStatus* SelectShapeContext(TensorrtRtxEpContextNodeComputeState& state,
++                                    TensorrtRtxExecutionProvider& ep, OrtKernelContext* ctx)
++{
++    if (!ep.IsPersistentContextMemoryEnabled() || !ep.IsGraphCaptureEnabled() || !ep.external_stream_)
++        return nullptr;
++    const auto& runtime_cache_path = ep.GetShapeContextRuntimeCachePath();
++    auto ort_ctx = Ort::KernelContext(ctx);
++    std::string key;
++    for (size_t i = 0; i < ort_ctx.GetInputCount(); ++i)
++    {
++        key += "/";
++        for (auto dim : ort_ctx.GetInput(i).GetTensorTypeAndShapeInfo().GetShape())
++            key += std::to_string(dim) + ",";
++    }
++    if (state.shape_contexts.empty())
++    {
++        auto initial = std::make_unique<CachedShapeContext>();
++        initial->context = state.context;
++        state.shape_contexts.emplace(key, std::move(initial));
++        state.active_shape = key;
++        return nullptr;
++    }
++    if (key == state.active_shape)
++        return nullptr;
++    auto found = state.shape_contexts.find(key);
++    if (found == state.shape_contexts.end())
++    {
++        if (state.shape_contexts.size() >= 16)
++            return nullptr;
++        auto config = std::unique_ptr<nvinfer1::IRuntimeConfig>((*state.engine)->createRuntimeConfig());
++        if (!config)
++            return ep.ort_api.CreateStatus(ORT_EP_FAIL, "Could not create shared-engine runtime configuration");
++        config->setDynamicShapesKernelSpecializationStrategy(nvinfer1::DynamicShapesKernelSpecializationStrategy::kEAGER);
++        config->setCudaGraphStrategy(nvinfer1::CudaGraphStrategy::kWHOLE_GRAPH_CAPTURE);
++        config->setExecutionContextAllocationStrategy(nvinfer1::ExecutionContextAllocationStrategy::kUSER_MANAGED);
++        std::filesystem::path cache_path;
++        std::unique_ptr<nvinfer1::IRuntimeCache> cache;
++        if (!runtime_cache_path.empty())
++        {
++            auto resolved = ResolveRuntimeCacheFile(runtime_cache_path,
++                state.fused_node_name + "_shape_" + std::to_string(std::hash<std::string>{}(key)), ep.logger_, ep.ort_api);
++            if (resolved)
++            {
++                cache_path = *resolved;
++                cache = CreateAndAttachRuntimeCache(*config, cache_path, ep.logger_, ep.ort_api);
++            }
++        }
++        auto context = CreateOwnedExecutionContext(**state.engine, cache_path, std::move(cache), std::move(config), ep.ort_api);
++        if (!context)
++            return ep.ort_api.CreateStatus(ORT_EP_FAIL, "Could not create shared-engine execution context");
++        if (ep.profiling_enable_)
++            context->setProfiler(ep.profiler_.get());
++        auto entry = std::make_unique<CachedShapeContext>();
++        entry->owned_context = std::make_unique<tensorrt_ptr::unique_pointer_exec_ctx>(std::move(context));
++        entry->context = entry->owned_context.get();
++        found = state.shape_contexts.emplace(key, std::move(entry)).first;
++    }
++    auto& previous = *state.shape_contexts.at(state.active_shape);
++    previous.input_tensors = std::move(state.input_tensors);
++    previous.output_tensors = std::move(state.output_tensors);
++    previous.scratch_buffers = std::move(state.scratch_buffers);
++    previous.is_first_run = state.is_first_run;
++    previous.skip_io_binding_allowed = state.skip_io_binding_allowed;
++    auto& next = *found->second;
++    state.context = next.context;
++    state.input_tensors = std::move(next.input_tensors);
++    state.output_tensors = std::move(next.output_tensors);
++    state.scratch_buffers = std::move(next.scratch_buffers);
++    state.is_first_run = next.is_first_run;
++    state.skip_io_binding_allowed = next.skip_io_binding_allowed;
++    state.active_shape = key;
++    return nullptr;
++}
++
+ OrtStatusPtr BindKernelOutput(Ort::KernelContext& ctx, const OrtMemoryInfo* /*mem_info*/,
+                               DDSOutputAllocatorMap& allocator_map, char const* output_name, size_t output_index,
+                               size_t output_type, cudaStream_t stream)
+@@ -5800,6 +5878,7 @@ OrtStatus* TensorRtRtxEpContextNodeComputeInfo::ComputeImpl(OrtNodeComputeInfo*
+     const auto& fused_node_name = trt_state->fused_node_name;
+     auto& dds_output_allocator_map = ep.dds_output_allocator_maps_[fused_node_name];
+     auto trt_engine = trt_state->engine->get();
++    RETURN_IF_ERROR(SelectShapeContext(*trt_state, ep, kernel_context));
+     auto trt_context = trt_state->context->get();
+     std::unordered_map<std::string, std::vector<int32_t>>
+         shape_tensor_values;  // This map holds "shape tensor -> shape values" for the shape tensor input across this
+diff --git a/src/tensorrt_rtx_execution_provider.h b/src/tensorrt_rtx_execution_provider.h
+index 12fb88c..35a9201 100644
+--- a/src/tensorrt_rtx_execution_provider.h
++++ b/src/tensorrt_rtx_execution_provider.h
+@@ -447,6 +447,18 @@ struct TensorrtRtxComputeState
+ //!
+ //! \brief Minimum information to construct kernel function state for direct engine load code path.
+ //!
++struct CachedShapeContext
++{
++    // Engine weights and the serial execution workspace remain shared.
++    std::unique_ptr<tensorrt_ptr::unique_pointer_exec_ctx> owned_context;
++    tensorrt_ptr::unique_pointer_exec_ctx* context = nullptr;
++    std::vector<AllocatorUniquePtr<void>> scratch_buffers;
++    std::vector<TensorParams> input_tensors;
++    std::vector<TensorParams> output_tensors;
++    bool is_first_run = true;
++    bool skip_io_binding_allowed = false;
++};
++
+ struct TensorrtRtxEpContextNodeComputeState
+ {
+     uint32_t device_id;
+@@ -464,6 +476,9 @@ struct TensorrtRtxEpContextNodeComputeState
+     bool is_first_run = true;                           //!< Indicates if this is the first run of the engine
+     bool skip_io_binding_allowed = false;               //!< Indicates if input/output binding can be skipped
+     AllocatorUniquePtr<void> execution_context_memory;  //!< Optional device allocation retained between runs
++    // Declared after workspace so cached contexts are destroyed first.
++    std::unordered_map<std::string, std::unique_ptr<CachedShapeContext>> shape_contexts;
++    std::string active_shape;
+ };
+ 
+ //!
+@@ -758,6 +773,8 @@ public:
+     {
+         return info_.persistent_context_memory;
+     }
++
++    const std::filesystem::path& GetShapeContextRuntimeCachePath() const { return runtime_cache_; }
+     bool IsGraphCaptureAllowed(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
+     bool IsGraphCaptureAllowedOnRun(CudaGraphAnnotation_t cuda_graph_annotation_id) const;
+     CudaGraphAnnotation_t GetCudaGraphAnnotationId(const OrtRunOptions* run_options) const;
