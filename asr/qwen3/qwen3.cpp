@@ -498,7 +498,7 @@ const din::io::Audio& NormalizeAudio(const din::io::Audio& audio, din::io::Audio
 
 struct TextInputs
 {
-    Buffer<int64_t> ids, positions;
+    Buffer<int64_t> ids, positions, logits_index;
     Ort::Value audio;
     FloatBuffer bias;
     Buffer<bool> mask;
@@ -509,6 +509,7 @@ struct TextInputs
     TextInputs(OrtRunner& runner, int64_t seq, int64_t width, int64_t keys, ONNXTensorElementDataType dtype)
         : ids(runner, {1, seq}, true)
         , positions(runner, {1, seq}, true)
+        , logits_index(runner, {1}, true)
         , audio(DeviceValue(runner, {1, seq, width}, dtype))
         , bias(runner, {1, 1, seq, keys}, dtype)
         , mask(runner, {1, seq, 1}, true)
@@ -524,15 +525,15 @@ struct TextInputs
     void Fill(std::span<const int64_t> tokens, int64_t start, int64_t audio_id, const EncodedAudio* embeddings,
               int64_t audio_offset = 0)
     {
-        if (tokens.size() != static_cast<size_t>(sequence) || start + sequence > capacity)
+        if (tokens.empty() || tokens.size() > static_cast<size_t>(sequence) || start + sequence > capacity)
             throw std::runtime_error("Input exceeds the exported context capacity");
         int64_t audio_pos = audio_offset;
         bool mask_changed = false;
         for (int64_t i = 0; i < sequence; ++i)
         {
-            ids.HostData()[i] = tokens[i];
+            ids.HostData()[i] = i < static_cast<int64_t>(tokens.size()) ? tokens[i] : 0;
             positions.HostData()[i] = start + i;
-            const bool is_audio = embeddings && tokens[i] == audio_id;
+            const bool is_audio = embeddings && i < static_cast<int64_t>(tokens.size()) && tokens[i] == audio_id;
             mask_changed |= mask.HostData()[i] != is_audio;
             mask.HostData()[i] = is_audio;
             if (is_audio)
@@ -553,12 +554,14 @@ struct TextInputs
                     std::fill_n(data + i * capacity + visible, capacity - visible, T(-1e4f));
                 }
             });
+        logits_index.HostData()[0] = tokens.size() - 1;
+        logits_index.CopyAsyncToDevice();
         ids.CopyAsyncToDevice();
         positions.CopyAsyncToDevice();
         // Audio placeholders form contiguous runs; assemble embeddings directly on
         // the shared stream instead of downloading each encoder window to the CPU.
         audio_pos = audio_offset;
-        for (int64_t i = 0; embeddings && i < sequence;)
+        for (int64_t i = 0; embeddings && i < static_cast<int64_t>(tokens.size());)
         {
             if (tokens[i] != audio_id)
             {
@@ -566,7 +569,7 @@ struct TextInputs
                 continue;
             }
             const int64_t begin = i;
-            while (i < sequence && tokens[i] == audio_id)
+            while (i < static_cast<int64_t>(tokens.size()) && tokens[i] == audio_id)
                 ++i;
             CopyDevice(runner, audio, embeddings->values, (i - begin) * hidden, begin * hidden, audio_pos * hidden);
             audio_pos += i - begin;
@@ -579,8 +582,10 @@ struct TextInputs
         bias.CopyAsyncToDevice();
     }
 
-    void Bind(Ort::IoBinding& binding)
+    void Bind(Ort::IoBinding& binding, bool decoder = false)
     {
+        if (decoder)
+            binding.BindInput("logits_index", logits_index.BindingValue());
         binding.BindInput("input_ids", ids.BindingValue());
         binding.BindInput("position_ids", positions.BindingValue());
         binding.BindInput("audio_embeddings", audio);
@@ -597,7 +602,7 @@ struct Qwen3Pipeline::Impl
         Json metadata, native;
         ONNXTensorElementDataType dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
         std::unique_ptr<din::io::Tokenizer> tokenizer;
-        std::unique_ptr<OrtRunner> encoder, text, decode_alt;
+        std::unique_ptr<OrtRunner> encoder, text, prefill;
         int64_t hidden = 0, audio_id = 0, window = 0;
 
         struct EncoderBuffers
@@ -612,7 +617,7 @@ struct Qwen3Pipeline::Impl
                 : frames(count)
                 , tokens(AudioTokens(count))
                 , mel(runner, {(count + 99) / 100, 128, 100}, dtype, true)
-                , bias(runner, {1, 1, tokens, tokens}, dtype)
+                , bias(runner, {1, 1, tokens, tokens}, dtype, true)
                 , indices(runner, {tokens}, true)
                 , output(DeviceValue(runner, {tokens, hidden}, dtype))
                 , binding(runner.session)
@@ -630,8 +635,8 @@ struct Qwen3Pipeline::Impl
             }
         };
 
-        // Stable addresses for repeated full windows and the current tail.
-        std::unique_ptr<EncoderBuffers> full_window, tail_window;
+        // Pad the last encoder window so all audio lengths reuse one GPU shape.
+        std::unique_ptr<EncoderBuffers> full_window;
 
         EncodedAudio Encode(const std::vector<float>& features, int64_t frames)
         {
@@ -644,10 +649,21 @@ struct Qwen3Pipeline::Impl
             {
                 din::common::nvtx_scoped_range range{"qwen3.encoder_window"};
                 const auto count = std::min(window, frames - offset);
-                auto& buffers = count == window ? full_window : tail_window;
-                if (!buffers || buffers->frames != count)
-                    buffers = std::make_unique<EncoderBuffers>(*encoder, count, hidden, dtype);
-                auto& input = *buffers;
+                if (!full_window)
+                    full_window = std::make_unique<EncoderBuffers>(*encoder, window, hidden, dtype);
+                auto& input = *full_window;
+                const auto valid_tokens = AudioTokens(count);
+                input.bias.WithHost(
+                    [&](auto* data)
+                    {
+                        using T = std::remove_pointer_t<decltype(data)>;
+                        for (int64_t i = 0; i < input.tokens; ++i)
+                        {
+                            std::fill_n(data + i * input.tokens, valid_tokens, T(0.f));
+                            std::fill_n(data + i * input.tokens + valid_tokens, input.tokens - valid_tokens, T(-1e4f));
+                        }
+                    });
+                input.bias.CopyAsyncToDevice();
                 input.mel.Fill(0.f);
                 input.mel.WithHost(
                     [&](auto* data)
@@ -662,8 +678,8 @@ struct Qwen3Pipeline::Impl
                 // window's CPU preparation can overlap this window's inference.
                 input.mel.UploadAndWait();
                 encoder->session.Run(options, input.binding);
-                CopyDevice(*encoder, result.values, input.output, input.tokens * hidden, token_offset * hidden);
-                token_offset += input.tokens;
+                CopyDevice(*encoder, result.values, input.output, valid_tokens * hidden, token_offset * hidden);
+                token_offset += valid_tokens;
             }
             return result;
         }
@@ -677,15 +693,11 @@ struct Qwen3Pipeline::Impl
     std::unique_ptr<Model> aligner;
     int64_t capacity = 0;
     std::vector<int64_t> eos;
-    std::array<std::vector<Ort::Value>, 2> cache;
-    std::unique_ptr<TextInputs> step;
-    // Retain one full block and the current tail per cache bank, with stable addresses.
-    std::array<std::unique_ptr<TextInputs>, 2> prefill_full, prefill_tail;
+    std::vector<Ort::Value> cache;
+    std::unique_ptr<TextInputs> step, prefill;
     Ort::Value logits{nullptr};
     std::unique_ptr<Buffer<int64_t>> next_token;
-    std::array<std::unique_ptr<Ort::IoBinding>, 2> decode_bindings;
-    std::unique_ptr<OrtRunner> fast_decode, spare_decode;
-    int64_t fast_capacity = 0, spare_capacity = 0;
+    std::unique_ptr<Ort::IoBinding> decode_binding, prefill_binding;
     Ort::RunOptions decode_options;
 
     explicit Impl(Qwen3Config cfg, bool alignment_only = false)
@@ -713,80 +725,41 @@ struct Qwen3Pipeline::Impl
         }
     }
 
-    void PrepareCache(int64_t required)
+    void PrepareCache()
     {
-        din::common::nvtx_scoped_range range{"qwen3.prepare_cache"};
-        const int64_t maximum = asr.metadata.at("cache_capacity");
-        int64_t requested = maximum;
-        if (asr.metadata.value("dynamic_cache_capacity", false))
-        {
-            requested = 4;
-            while (requested < required && requested < maximum)
-                requested *= 2;
-            requested = std::min(requested, maximum);
-        }
-        if (requested == capacity)
+        if (!cache.empty())
             return;
-        for (auto& binding : decode_bindings)
-            binding.reset();
-        step.reset();
-        for (auto& input : prefill_full)
-            input.reset();
-        for (auto& input : prefill_tail)
-            input.reset();
-        for (auto& buffers : cache)
-            buffers.clear();
-        capacity = requested;
-        const auto decode_capacities = asr.metadata.value("decode_capacities", std::vector<int64_t>{});
-        if (std::find(decode_capacities.begin(), decode_capacities.end(), capacity) != decode_capacities.end())
-        {
-            // Retain at most two engines for the usual full-chunk/tail buckets.
-            // Switching chunks should not reload weights and JIT-specialize again.
-            if (spare_capacity == capacity)
-            {
-                std::swap(fast_decode, spare_decode);
-                std::swap(fast_capacity, spare_capacity);
-            }
-            else if (fast_capacity != capacity)
-            {
-                spare_decode = std::move(fast_decode);
-                spare_capacity = fast_capacity;
-                fast_decode = Runner(config.model_dir, "decode_" + std::to_string(capacity), "", "", "");
-                fast_capacity = capacity;
-            }
-        }
-        else if (fast_decode)
-        {
-            spare_decode = std::move(fast_decode);
-            spare_capacity = fast_capacity;
-            fast_capacity = 0;
-        }
+        capacity = asr.metadata.at("cache_capacity");
         const auto& c = asr.metadata["text_config"];
-        const int layers = c["num_hidden_layers"];
         const std::vector<int64_t> shape{1, c["num_key_value_heads"], capacity, c["head_dim"]};
-        for (auto& buffers : cache)
-            for (int i = 0; i < 2 * layers; ++i)
-                buffers.push_back(DeviceValue(*asr.text, shape, asr.dtype));
+        for (int i = 0; i < 2 * c["num_hidden_layers"].get<int>(); ++i)
+            cache.push_back(DeviceValue(*asr.text, shape, asr.dtype));
         step = std::make_unique<TextInputs>(*asr.text, 1, asr.hidden, capacity, asr.dtype);
+        prefill = std::make_unique<TextInputs>(*asr.prefill, kPrefillBlock, asr.hidden, capacity, asr.dtype);
         logits = DeviceValue(*asr.text, {1, c["vocab_size"]}, asr.dtype);
         next_token = std::make_unique<Buffer<int64_t>>(*asr.text, std::vector<int64_t>{1}, true);
-        for (int bank = 0; bank < (fast_decode ? 1 : 2); ++bank)
-        {
-            auto& runner = fast_decode ? fast_decode : (bank ? asr.decode_alt : asr.text);
-            decode_bindings[bank] = std::make_unique<Ort::IoBinding>(runner->session);
-            step->Bind(*decode_bindings[bank]);
-            BindDecode(*decode_bindings[bank], bank, fast_decode != nullptr);
-        }
+        decode_binding = std::make_unique<Ort::IoBinding>(asr.text->session);
+        prefill_binding = std::make_unique<Ort::IoBinding>(asr.prefill->session);
+        step->Bind(*decode_binding, true);
+        prefill->Bind(*prefill_binding, true);
+        BindDecode(*decode_binding);
+        BindDecode(*prefill_binding);
     }
 
     std::unique_ptr<OrtRunner> Runner(const std::filesystem::path& dir, const std::string& name, const std::string& min,
-                                      const std::string& opt, const std::string& max)
+                                      const std::string& opt, const std::string& max, const std::string& variant = "")
     {
         din::common::ModelProfile profile;
         profile.min_shapes = min;
         profile.opt_shapes = opt;
         profile.max_shapes = max;
-        profile.cache_subpath = dir.filename().string() + "_qwen3_profiled_" + name;
+        const auto metadata = ReadJson(dir / "metadata.json");
+        const auto identity = metadata.contains("graphs") && metadata["graphs"].contains(name)
+                                  ? metadata["graphs"][name].get<std::string>().substr(0, 16)
+                                  : dir.filename().string();
+        profile.cache_subpath = "qwen3_" + name + "_" + identity + "_fixed" + variant;
+        if (name == "decoder")
+            profile.cache_subpath += "_kv" + asr.metadata["cache_capacity"].dump();
         if (name == "aligner")
             profile.cache_subpath += "_bins";
         profile.enable_cuda_graph = name != "aligner";
@@ -798,9 +771,11 @@ struct Qwen3Pipeline::Impl
             profile.cache_subpath += "_no_graph";
         }
         profile.embed_ep_context = false;
+        // ORT names external engines by graph, so different profiles need separate directories.
         return std::make_unique<OrtRunner>(
             env, (dir / (name + ".onnx")).string(), "trt-rtx", config.ep_cache_dir.string(),
-            din::common::EpContextOptions{config.ep_context_dir.string(), config.progress}, profile, &stream);
+            din::common::EpContextOptions{(config.ep_context_dir / profile.cache_subpath).string(), config.progress},
+            profile, &stream);
     }
 
     void LoadModel(Model& model, const std::filesystem::path& dir, const std::string& task)
@@ -808,8 +783,12 @@ struct Qwen3Pipeline::Impl
         model.metadata = ReadJson(dir / "metadata.json");
         model.native = ReadJson(dir / "native.json");
         const auto& meta = model.metadata;
-        if (meta.at("format_version") != 2 || meta.at("task") != task)
-            throw std::runtime_error("Native Qwen3 requires format-2 " + task + " exports");
+        if (meta.at("format_version") != (task == "asr" ? 3 : 2) || meta.at("task") != task)
+            throw std::runtime_error("Re-export Qwen3 for the unified in-place decoder");
+        if (task == "asr" &&
+            (meta.at("prefill_block") != kPrefillBlock || meta.at("cache_capacity").get<int64_t>() < kPrefillBlock ||
+             meta.at("cache_capacity").get<int64_t>() % kPrefillBlock))
+            throw std::runtime_error("Unsupported Qwen3 cache geometry");
         const auto precision = meta.at("dtype").get<std::string>();
         if (precision == "bfloat16")
             model.dtype = ONNX_TENSOR_ELEMENT_DATA_TYPE_BFLOAT16;
@@ -821,7 +800,8 @@ struct Qwen3Pipeline::Impl
             throw std::runtime_error("Unsupported Qwen3 export precision: " + precision);
         if (task == "aligner" && !meta.value("timestamp_bins", false))
             throw std::runtime_error("Re-export the aligner with --only aligner for GPU timestamp selection");
-        if (meta["audio_config"]["num_mel_bins"] != 128 || meta["audio_config"]["n_window"] != 50)
+        if (meta["audio_config"]["num_mel_bins"] != 128 || meta["audio_config"]["n_window"] != 50 ||
+            meta["audio_config"]["n_window_infer"] != 800)
             throw std::runtime_error("Unsupported audio geometry");
         model.window = meta["audio_config"]["n_window_infer"];
         model.hidden = meta["text_config"]["hidden_size"];
@@ -833,7 +813,7 @@ struct Qwen3Pipeline::Impl
             return "mel_chunks:" + std::to_string(chunks) + "x128x100,valid_indices:" + std::to_string(tokens) +
                    ",attention_bias:1x1x" + std::to_string(tokens) + "x" + std::to_string(tokens);
         };
-        model.encoder = Runner(dir, "encoder", enc_shapes(1, 1), enc_shapes(8, 104), enc_shapes(8, 104));
+        model.encoder = Runner(dir, "encoder", enc_shapes(8, 104), enc_shapes(8, 104), enc_shapes(8, 104));
         const int64_t cap = task == "asr" ? meta["cache_capacity"].get<int64_t>() : 8192;
         auto text_shapes = [&](int64_t seq, int slots, int64_t keys)
         {
@@ -843,43 +823,30 @@ struct Qwen3Pipeline::Impl
                           std::to_string(task == "asr" ? keys : seq);
             if (task == "aligner")
                 result += ",timestamp_indices:" + std::to_string(slots);
-            if (task == "asr" && meta.value("dynamic_cache_capacity", false))
-            {
-                const auto& c = meta["text_config"];
-                for (int i = 0; i < 2 * c["num_hidden_layers"].get<int>(); ++i)
-                    result += ",past_" + std::to_string(i) + ":1x" +
-                              std::to_string(c["num_key_value_heads"].get<int>()) + "x" + std::to_string(keys) + "x" +
-                              std::to_string(c["head_dim"].get<int>());
-            }
+            if (task == "asr")
+                result += ",logits_index:1";
             return result;
         };
-        const auto min = text_shapes(task == "asr" ? 1 : 4, 2, meta.value("dynamic_cache_capacity", false) ? 4 : cap);
-        const auto opt = text_shapes(std::min<int64_t>(128, cap), 32,
-                                     meta.value("dynamic_cache_capacity", false) ? std::min<int64_t>(2048, cap) : cap);
-        const auto max = text_shapes(task == "asr" ? std::min<int64_t>(kPrefillBlock, cap) : cap, 4096, cap);
-        model.text = Runner(dir, task == "asr" ? "decoder" : "aligner", min, opt, max);
-        // One context per bank keeps CUDA graph bindings stable during decode.
+        const auto min = text_shapes(task == "asr" ? 1 : 4, 2, cap);
+        const auto opt = text_shapes(task == "asr" ? 1 : 128, 32, cap);
+        const auto max = text_shapes(task == "asr" ? kPrefillBlock : cap, 4096, cap);
+        model.text = Runner(dir, task == "asr" ? "decoder" : "aligner", min, task == "asr" ? min : opt,
+                            task == "asr" ? min : max);
         if (task == "asr")
-            model.decode_alt = Runner(dir, "decoder", min, opt, max);
+            model.prefill = Runner(dir, "decoder", max, max, max, "_prefill");
         if (!model.encoder->HasDeviceIo() || !model.text->HasDeviceIo())
             throw std::runtime_error("GPU I/O is required");
     }
 
-    void BindDecode(Ort::IoBinding& binding, int bank, bool inplace = false)
+    void BindDecode(Ort::IoBinding& binding)
     {
-        for (size_t i = 0; i < cache[bank].size(); ++i)
+        for (size_t i = 0; i < cache.size(); ++i)
         {
-            binding.BindInput(("past_" + std::to_string(i)).c_str(), cache[bank][i]);
-            binding.BindOutput(("present_" + std::to_string(i)).c_str(), cache[inplace ? bank : 1 - bank][i]);
+            binding.BindInput(("past_" + std::to_string(i)).c_str(), cache[i]);
+            binding.BindOutput(("present_" + std::to_string(i)).c_str(), cache[i]);
         }
         binding.BindOutput("logits", logits);
         binding.BindOutput("next_token", next_token->BindingValue());
-    }
-
-    void Decode(int bank)
-    {
-        auto& runner = fast_decode ? fast_decode : (bank ? asr.decode_alt : asr.text);
-        runner->session.Run(decode_options, *decode_bindings[bank]);
     }
 
     std::vector<float> Features(std::span<const float> audio)
@@ -979,40 +946,22 @@ struct Qwen3Pipeline::Impl
         if (!asr.native.contains("suffixes"))
             throw std::runtime_error("Re-export native prompt assets with --only mel for official language forcing");
         Append(ids, asr.native["suffixes"][config.lang_id].get<std::vector<int64_t>>());
-        PrepareCache(ids.size() + config.max_new_tokens);
-        if (ids.size() >= static_cast<size_t>(capacity))
-            throw std::runtime_error("Prompt fills the exported KV capacity; re-export with --cache-capacity 32768");
+        PrepareCache();
+        if (ids.size() + config.max_new_tokens > static_cast<size_t>(capacity))
+            throw std::runtime_error("Prompt and generation budget exceed the exported KV capacity");
         // Clear on the shared CUDA stream. Unused NaN cache values can poison attention even when masked.
-        for (auto& value : cache[0])
+        for (auto& value : cache)
             ZeroDevice(*asr.text, value);
-        int bank = 0;
         int64_t audio_offset = 0;
         for (size_t offset = 0; offset < ids.size(); offset += kPrefillBlock)
         {
             din::common::nvtx_scoped_range range{"qwen3.prefill"};
             const auto block =
                 std::span<const int64_t>(ids).subspan(offset, std::min<size_t>(kPrefillBlock, ids.size() - offset));
-            auto& runner = bank ? asr.decode_alt : asr.text;
-            auto& prefill = (block.size() == kPrefillBlock ? prefill_full : prefill_tail)[bank];
-            if (!prefill || prefill->sequence != static_cast<int64_t>(block.size()))
-                prefill = std::make_unique<TextInputs>(*runner, block.size(), asr.hidden, capacity, asr.dtype);
             prefill->Fill(block, offset, asr.audio_id, &encoded, audio_offset);
             audio_offset += std::count(block.begin(), block.end(), asr.audio_id);
-            Ort::IoBinding binding(runner->session);
-            prefill->Bind(binding);
-            BindDecode(binding, bank);
-            runner->session.Run(Ort::RunOptions{}, binding);
-            binding.SynchronizeOutputs();
-            bank = 1 - bank;
-        }
-        if (fast_decode && bank != 0)
-        {
-            // One handoff copy, on the shared stream. Decode then updates this bank
-            // in place with stable graph addresses; prefill remains non-aliasing.
-            for (size_t i = 0; i < cache[0].size(); ++i)
-                CopyDevice(*asr.text, cache[0][i], cache[bank][i],
-                           cache[0][i].GetTensorTypeAndShapeInfo().GetElementCount());
-            bank = 0;
+            asr.prefill->session.Run(Ort::RunOptions{}, *prefill_binding);
+            prefill_binding->SynchronizeOutputs();
         }
         int64_t position = ids.size();
         TranscriptionResult result;
@@ -1030,9 +979,7 @@ struct Qwen3Pipeline::Impl
             if (position >= capacity || count + 1 == config.max_new_tokens)
                 break;
             step->Fill(std::span(&token, 1), position++, asr.audio_id, nullptr);
-            Decode(bank);
-            if (!fast_decode)
-                bank = 1 - bank;
+            asr.text->session.Run(decode_options, *decode_binding);
         }
         auto text_tokens = result.tokens;
         if (result.reached_eos)
@@ -1077,7 +1024,21 @@ struct Qwen3Pipeline::Impl
         TranscriptionResult result;
         result.reached_eos = true;
         std::string previous_language;
-        for (const auto chunk : detail::SplitAudio(source->samples, config.max_chunk_seconds))
+        const int64_t prompt =
+            asr.native["prefixes"][config.lang_id].size() + asr.native["suffixes"][config.lang_id].size();
+        const int64_t available = asr.metadata["cache_capacity"].get<int64_t>() - prompt - config.max_new_tokens;
+        const int seconds = static_cast<int>(available / 13);
+        if (seconds < 1)
+            throw std::invalid_argument(
+                "Generation budget leaves no room for audio; increase cache-capacity or reduce max-new-tokens");
+        // Preserve upstream boundaries when possible; reserve the +5s quiet search margin.
+        const int target = std::min(config.max_chunk_seconds, seconds - 5);
+        if (source->samples.size() > static_cast<size_t>(seconds) * kRate && target < 6)
+            throw std::invalid_argument("KV capacity is too small for long-form quiet-boundary splitting");
+        const auto chunks = source->samples.size() <= static_cast<size_t>(seconds) * kRate && target < 6
+                                ? std::vector<detail::AudioChunk>{{0, source->samples.size()}}
+                                : detail::SplitAudio(source->samples, std::max(6, target));
+        for (const auto chunk : chunks)
         {
             auto part = TranscribeChunk(std::span(source->samples).subspan(chunk.begin, chunk.end - chunk.begin));
             result.text += part.text;  // Upstream joins literally, without overlap or inserted separators.

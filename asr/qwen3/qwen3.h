@@ -20,7 +20,7 @@ struct Qwen3Config
     std::filesystem::path ep_context_dir = "artifacts/qwen3/ep_context";
     std::string lang_id = "auto";
     int max_new_tokens = 512;   // Official Transformers wrapper default; increase for long speech.
-    int max_chunk_seconds = 0;  // Zero selects 1200 for ASR or 180 with alignment; boundaries may add 5 s.
+    int max_chunk_seconds = 0;  // Auto: 1200 s ASR / 180 s aligned, limited by KV capacity; boundaries add up to 5 s.
     din::common::ProgressCallback progress;
 };
 

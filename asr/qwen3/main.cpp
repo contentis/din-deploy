@@ -30,7 +30,8 @@ int main(int argc, char** argv)
         parser.add_argument("--max-chunk-seconds")
             .default_value(config.max_chunk_seconds)
             .scan<'i', int>()
-            .help("Chunk target: 0 = auto (1200 s ASR / 180 s aligned); quiet-boundary search may add 5 s");
+            .help(
+                "Chunk target: 0 = auto (1200 s ASR / 180 s aligned), limited by KV capacity; boundaries may add 5 s");
         parser.parse_args(argc, argv);
         config.model_dir = parser.get<std::string>("--model-dir");
         config.aligner_dir = parser.get<std::string>("--aligner-dir");

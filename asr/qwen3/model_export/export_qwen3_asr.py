@@ -2,6 +2,7 @@
 """Export Qwen3-ASR with explicit tensor interfaces; checkpoint BF16 is the default."""
 
 import argparse
+import hashlib
 import json
 import sys
 from pathlib import Path
@@ -186,56 +187,6 @@ class DecodeCache:
         return tuple(updated)
 
 
-def export_decode(decoder, config, dtype, output, capacities):
-    AttentionInterface.register("qwen3_onnx_decode", decode_attention)
-    decoder.decoder.config._attn_implementation = "qwen3_onnx_decode"
-    decoder.cache_type = DecodeCache
-    past = tuple(
-        torch.zeros(1, config.num_key_value_heads, 4, config.head_dim, dtype=dtype)
-        for _ in range(2 * config.num_hidden_layers)
-    )
-    inputs = (
-        torch.ones(1, 1, dtype=torch.int64),
-        torch.zeros(1, 1, config.hidden_size, dtype=dtype),
-        torch.zeros(1, 1, 1, dtype=torch.bool),
-        torch.zeros(1, 1, dtype=torch.int64),
-        torch.zeros(1, 1, 1, 4, dtype=dtype),
-        *past,
-    )
-    cap = torch.export.Dim("capacity", min=4)
-    names = ["input_ids", "audio_embeddings", "audio_mask", "position_ids", "attention_bias"]
-    # Export weights once; specialized graph headers share the same external data.
-    template = output / "decode.onnx"
-    torch.onnx.export(
-        decoder.eval(),
-        inputs,
-        str(template),
-        dynamo=True,
-        opset_version=24,
-        external_data=True,
-        input_names=names + [f"past_{i}" for i in range(len(past))],
-        output_names=["logits", "next_token"] + [f"present_{i}" for i in range(len(past))],
-        dynamic_shapes={
-            "input_ids": {},
-            "audio_embeddings": {},
-            "audio_mask": {},
-            "position_ids": {},
-            "attention_bias": {3: cap},
-            "past": tuple({2: cap} for _ in past),
-        },
-    )
-    for capacity in sorted(set(capacities)):
-        graph = onnx.load(template, load_external_data=False)
-        for value in list(graph.graph.input) + list(graph.graph.output) + list(graph.graph.value_info):
-            for dim in value.type.tensor_type.shape.dim:
-                if dim.dim_param == "capacity":
-                    dim.dim_value = capacity
-        path = output / f"decode_{capacity}.onnx"
-        onnx.save(graph, path)
-        onnx.checker.check_model(str(path))
-        print(f"Checked {path}", flush=True)
-
-
 def attention(q, k, v, bias, scale):
     scores = q @ k.transpose(-1, -2) * scale + bias
     return torch.softmax(scores.float(), dim=-1).to(v.dtype) @ v
@@ -292,33 +243,17 @@ def export_attention(module, query, key, value, attention_mask, scaling=None, **
 AttentionInterface.register("qwen3_onnx", export_attention)
 
 
-class ExportCache:
-    """Tensor-only HF cache adapter, using Whisper's fixed-capacity index updates."""
-
-    def __init__(self, past, positions):
-        self.past = past
-        self.positions = positions.reshape(-1)
-        self.present = []
-
-    def update(self, key, value, layer_idx):
-        key = self.past[2 * layer_idx].index_copy(2, self.positions, key)
-        value = self.past[2 * layer_idx + 1].index_copy(2, self.positions, value)
-        self.present.extend((key, value))
-        return key, value
-
-
 class TextBackbone(nn.Module):
     def __init__(self, model):
         super().__init__()
         self.decoder = model.model.language_model
         self.decoder.config._attn_implementation = "qwen3_onnx"
-        self.cache_type = ExportCache
 
     def hidden(self, input_ids, audio_embeddings, audio_mask, position_ids, attention_bias, *past):
         dec = self.decoder
         x = torch.where(audio_mask, audio_embeddings, dec.embed_tokens(input_ids))
         rotary = dec.rotary_emb(x, position_ids)
-        cache = self.cache_type(past, position_ids) if past else None
+        cache = DecodeCache(past, position_ids) if past else None
         for layer in dec.layers:
             x = layer(x, attention_mask=attention_bias, position_embeddings=rotary, past_key_values=cache)
         return dec.norm(x), cache.present if cache else []
@@ -330,10 +265,12 @@ class TextDecoder(TextBackbone):
     def __init__(self, model):
         super().__init__(model)
         self.lm_head = model.lm_head
+        AttentionInterface.register("qwen3_onnx_decode", decode_attention)
+        self.decoder.config._attn_implementation = "qwen3_onnx_decode"
 
-    def forward(self, input_ids, audio_embeddings, audio_mask, position_ids, attention_bias, *past):
+    def forward(self, input_ids, audio_embeddings, audio_mask, position_ids, attention_bias, logits_index, *past):
         hidden, present = self.hidden(input_ids, audio_embeddings, audio_mask, position_ids, attention_bias, *past)
-        logits = self.lm_head(hidden[:, -1])
+        logits = self.lm_head(hidden.index_select(1, logits_index).squeeze(1))
         return logits, logits.argmax(-1), *present
 
 
@@ -352,6 +289,8 @@ class ForcedAligner(TextBackbone):
 
 def export(module, args, path, names, outputs, shapes):
     print(f"Exporting {path.name}", flush=True)
+    path.unlink(missing_ok=True)
+    path.with_suffix(".onnx.data").unlink(missing_ok=True)
     torch.onnx.export(
         module.eval(),
         args,
@@ -360,11 +299,27 @@ def export(module, args, path, names, outputs, shapes):
         output_names=outputs,
         dynamo=True,
         dynamic_shapes=shapes,
-        opset_version=23,
+        opset_version=24,
         external_data=True,
     )
     onnx.checker.check_model(str(path))
     print(f"Checked {path}", flush=True)
+
+
+def save_metadata(output, metadata):
+    metadata["graphs"] = {}
+    for name in ("mel", "encoder", "decoder" if metadata["task"] == "asr" else "aligner"):
+        if not (output / (name + ".onnx")).is_file():
+            continue
+        digest = hashlib.sha256()
+        for suffix in (".onnx", ".onnx.data"):
+            path = output / (name + suffix)
+            if path.exists():
+                with path.open("rb") as file:
+                    while data := file.read(8 * 1024 * 1024):
+                        digest.update(data)
+        metadata["graphs"][name] = digest.hexdigest()
+    (output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
 
 def main():
@@ -381,15 +336,9 @@ def main():
     parser.add_argument(
         "--calibration-audio", type=Path, nargs="+", help="Representative audio for FP8 activation calibration"
     )
-    parser.add_argument("--only", choices=["mel", "encoder", "decoder", "decode", "aligner"])
-    parser.add_argument(
-        "--decode-capacities",
-        type=int,
-        nargs="+",
-        help="Export optional in-place one-token graphs for these KV capacities (TensorRT RTX)",
-    )
+    parser.add_argument("--only", choices=["mel", "encoder", "decoder", "aligner"])
     parser.add_argument("--threads", type=int, default=4)
-    parser.add_argument("--cache-capacity", type=int, default=32768)
+    parser.add_argument("--cache-capacity", type=int, default=8192)
     args = parser.parse_args()
     prefix = "aligner-" if args.task == "aligner" else ""
     args.model = args.model or (
@@ -398,26 +347,18 @@ def main():
     precision = args.quantization or ("bf16" if args.dtype == "original" else args.dtype)
     size_suffix = "-1.7b" if args.task == "asr" and "1.7b" in args.model.lower() else ""
     args.output = args.output or Path(f"artifacts/qwen3/{prefix}onnx-{precision}{size_suffix}")
-    if args.quantization and (args.task != "asr" or args.dtype != "original" or args.only not in (None, "decode")):
-        parser.error("FP8 requires ASR with --dtype original and a full export or --only decode")
-    if args.quantization and args.only != "decode" and not args.calibration_audio:
+    if args.quantization and (args.task != "asr" or args.dtype != "original" or args.only not in (None, "decoder")):
+        parser.error("FP8 requires ASR with --dtype original and a full export or --only decoder")
+    if args.quantization and args.only != "decoder" and not args.calibration_audio:
         parser.error("FP8 requires --calibration-audio")
-    if args.calibration_audio and (not args.quantization or args.only == "decode"):
-        parser.error("--calibration-audio requires a full FP8 export; --only decode reuses saved scales")
+    if args.calibration_audio and (not args.quantization or args.only == "decoder"):
+        parser.error("--calibration-audio requires a full FP8 export; --only decoder reuses saved scales")
     if args.calibration_audio and any(not path.is_file() for path in args.calibration_audio):
         parser.error("Every calibration audio path must be an existing file")
     if args.threads < 1:
         parser.error("threads must be positive")
-    if args.cache_capacity < 4:
-        parser.error("cache-capacity must be at least 4")
-    if args.decode_capacities and (
-        args.task != "asr" or any(c < 4 or c > args.cache_capacity for c in args.decode_capacities)
-    ):
-        parser.error("decode-capacities requires ASR and capacities between 4 and cache-capacity")
-    if args.decode_capacities and max(args.decode_capacities) > 16384:
-        parser.error("TensorRT RTX 1.6 GQA decode supports up to 16384 slots; larger buckets use the general decoder")
-    if args.only == "decode" and (not args.decode_capacities or not (args.output / "metadata.json").exists()):
-        parser.error("--only decode requires --decode-capacities and an existing ASR export")
+    if args.task == "asr" and (not 512 <= args.cache_capacity <= 16384 or args.cache_capacity % 512):
+        parser.error("cache-capacity must be a multiple of 512 between 512 and 16384")
     metadata_path = args.output / "metadata.json"
     if args.only not in (None, "mel") and metadata_path.exists():
         existing = json.loads(metadata_path.read_text(encoding="utf-8"))
@@ -426,6 +367,8 @@ def main():
             parser.error("Partial export must keep the existing precision; use a separate output directory")
         if existing.get("quantization", {}).get("type") != args.quantization:
             parser.error("Partial export must keep the existing quantization")
+    if args.quantization and args.only == "decoder" and not metadata_path.exists():
+        parser.error("--only decoder with FP8 requires an existing export with saved calibration")
     torch.set_num_threads(args.threads)
     args.output.mkdir(parents=True, exist_ok=True)
     if args.only == "decoder" and args.task != "asr" or args.only == "aligner" and args.task != "aligner":
@@ -435,6 +378,8 @@ def main():
         processor.save_pretrained(args.output / "processor")
         save_native_assets(processor, args.output, args.task)
         export_mel(processor, args.output)
+        if metadata_path.exists():
+            save_metadata(args.output, json.loads(metadata_path.read_text(encoding="utf-8")))
         return
     model_class = Qwen3ASRForConditionalGeneration if args.task == "asr" else Qwen3ASRForTokenClassification
     model = model_class.from_pretrained(
@@ -444,10 +389,9 @@ def main():
         revision=args.revision,
     ).eval()
     revision = model.config._commit_hash or args.revision
-    if args.only != "decode":
-        processor = AutoProcessor.from_pretrained(args.model, revision=revision)
-        processor.save_pretrained(args.output / "processor")
-        save_native_assets(processor, args.output, args.task)
+    processor = AutoProcessor.from_pretrained(args.model, revision=revision)
+    processor.save_pretrained(args.output / "processor")
+    save_native_assets(processor, args.output, args.task)
     if args.only is None:
         export_mel(processor, args.output)
     cfg = model.config
@@ -460,27 +404,11 @@ def main():
         raise ValueError("Only default RoPE is supported by this draft")
     quantization = None
     if args.quantization:
-        if args.only == "decode":
+        if args.only == "decoder":
             quantization = existing["quantization"]
         else:
             quantization = {"type": "fp8", "activation_amax": calibrate_fp8(model, processor, args.calibration_audio)}
         apply_fp8(model, quantization["activation_amax"])
-    if args.only == "decode":
-        metadata = json.loads((args.output / "metadata.json").read_text(encoding="utf-8"))
-        if (
-            metadata["task"] != "asr"
-            or metadata["dtype"] != str(dtype).removeprefix("torch.")
-            or max(args.decode_capacities) > metadata["cache_capacity"]
-        ):
-            raise ValueError("Decode export must match the existing ASR precision and cache capacity")
-        for key in ("hidden_size", "num_hidden_layers", "num_key_value_heads", "head_dim", "vocab_size"):
-            if metadata["text_config"][key] != getattr(cfg.text_config, key):
-                raise ValueError(f"Decode export differs from the existing ASR config: {key}")
-        with torch.inference_mode():
-            export_decode(TextDecoder(model), cfg.text_config, dtype, args.output, args.decode_capacities)
-        metadata["decode_capacities"] = sorted(set(args.decode_capacities))
-        (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        return
     d = torch.export.Dim
     with torch.inference_mode():
         if args.only in (None, "encoder"):
@@ -499,20 +427,20 @@ def main():
         if args.task == "asr" and args.only in (None, "decoder"):
             c = cfg.text_config
             past = tuple(
-                torch.zeros(1, c.num_key_value_heads, 4, c.head_dim, dtype=dtype)
+                torch.zeros(1, c.num_key_value_heads, args.cache_capacity, c.head_dim, dtype=dtype)
                 for _ in range(2 * c.num_hidden_layers)
             )
-            seq = d("sequence", min=1, max=args.cache_capacity)
-            capacity = d("capacity", min=4, max=args.cache_capacity) if args.cache_capacity > 4 else None
+            seq = d("sequence", min=1, max=512)
             inputs = (
                 torch.ones(1, 3, dtype=torch.int64),
                 torch.zeros(1, 3, c.hidden_size, dtype=dtype),
                 torch.zeros(1, 3, 1, dtype=torch.bool),
                 torch.arange(3)[None],
-                torch.zeros(1, 1, 3, 4, dtype=dtype),
+                torch.zeros(1, 1, 3, args.cache_capacity, dtype=dtype),
+                torch.tensor([2]),
                 *past,
             )
-            names = ["input_ids", "audio_embeddings", "audio_mask", "position_ids", "attention_bias"]
+            names = ["input_ids", "audio_embeddings", "audio_mask", "position_ids", "attention_bias", "logits_index"]
             export(
                 TextDecoder(model),
                 inputs,
@@ -524,8 +452,9 @@ def main():
                     "audio_embeddings": {1: seq},
                     "audio_mask": {1: seq},
                     "position_ids": {1: seq},
-                    "attention_bias": {2: seq, **({3: capacity} if capacity else {})},
-                    "past": tuple({2: capacity} if capacity else {} for _ in past),
+                    "attention_bias": {2: seq},
+                    "logits_index": {},
+                    "past": tuple({} for _ in past),
                 },
             )
         if args.task == "aligner" and args.only in (None, "aligner"):
@@ -553,17 +482,14 @@ def main():
                     "timestamp_indices": {0: d("timestamp_slots", min=1)},
                 },
             )
-    if args.decode_capacities:
-        with torch.inference_mode():
-            export_decode(TextDecoder(model), cfg.text_config, dtype, args.output, args.decode_capacities)
     eos = cfg.eos_token_id
     metadata = {
-        "format_version": 2,
+        "format_version": 3 if args.task == "asr" else 2,
         "cache_capacity": args.cache_capacity if args.task == "asr" else None,
-        "dynamic_cache_capacity": args.task == "asr" and args.cache_capacity > 4,
+        "prefill_block": 512 if args.task == "asr" else None,
         "task": args.task,
         "dtype": str(dtype).removeprefix("torch."),
-        "opset": 23,
+        "opset": 24,
         "batch_size": 1,
         "audio_config": cfg.audio_config.to_dict(),
         "text_config": cfg.text_config.to_dict(),
@@ -582,17 +508,21 @@ def main():
     metadata["source"] = {"model": args.model, "revision": revision}
     if quantization:
         metadata["quantization"] = quantization
-    if args.decode_capacities:
-        metadata["decode_capacities"] = sorted(set(args.decode_capacities))
     if args.only == "encoder" and (args.output / "metadata.json").exists():
         previous = json.loads((args.output / "metadata.json").read_text(encoding="utf-8"))
         metadata["cache_capacity"] = previous["cache_capacity"]
-        metadata["dynamic_cache_capacity"] = previous.get("dynamic_cache_capacity", False)
-        if "decode_capacities" in previous and not args.decode_capacities:
-            metadata["decode_capacities"] = previous["decode_capacities"]
+        metadata["format_version"] = previous["format_version"]
+        metadata["prefill_block"] = previous.get("prefill_block")
         if args.task == "aligner":
             metadata["timestamp_bins"] = previous.get("timestamp_bins", False)
-    (args.output / "metadata.json").write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+    save_metadata(args.output, metadata)
+    if args.task == "asr" and args.only in (None, "decoder"):
+        for path in [
+            args.output / "decode.onnx",
+            args.output / "decode.onnx.data",
+            *args.output.glob("decode_[0-9]*.onnx"),
+        ]:
+            path.unlink(missing_ok=True)
 
 
 def export_mel(processor, output):

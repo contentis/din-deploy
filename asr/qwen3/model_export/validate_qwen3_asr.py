@@ -80,45 +80,39 @@ class OnnxAudioModel:
         self.directory = directory
         self.threads = threads
         self.metadata = json.loads((directory / "metadata.json").read_text(encoding="utf-8"))
+        if self.metadata["task"] != task or self.metadata["format_version"] != (3 if task == "asr" else 2):
+            raise ValueError("Incompatible export; re-export the model with the current exporter")
         self.processor = AutoProcessor.from_pretrained(directory / "processor", local_files_only=True)
         self.dtype = getattr(torch, self.metadata["dtype"])
         self.provider = provider or ("trt-rtx" if self.dtype in (torch.float16, torch.bfloat16) else "cpu")
-        options, providers = session_options(self.provider, threads)
+        encoder_shape = "mel_chunks:8x128x100,valid_indices:104,attention_bias:1x1x104x104"
+        options, providers = session_options(
+            self.provider, threads, {f"nv_profile_{bound}_shapes": encoder_shape for bound in ("min", "opt", "max")}
+        )
         self.encoder = ort.InferenceSession(str(directory / "encoder.onnx"), options, providers=providers)
         if self.text_graph == "decoder.onnx":
-            # Exclude zero-length queries and include the exported 32768-slot
-            # capacity, which TRT's implicit dynamic range does not cover.
             c = self.metadata["text_config"]
             capacity = self.metadata["cache_capacity"]
 
-            def shapes(sequence, keys):
-                shape = (
+            def shapes(sequence):
+                return (
                     f"input_ids:1x{sequence},audio_embeddings:1x{sequence}x{c['hidden_size']},"
                     f"audio_mask:1x{sequence}x1,position_ids:1x{sequence},"
-                    f"attention_bias:1x1x{sequence}x{keys}"
+                    f"attention_bias:1x1x{sequence}x{capacity},logits_index:1"
                 )
-                if self.metadata.get("dynamic_cache_capacity", False):
-                    for i in range(2 * c["num_hidden_layers"]):
-                        shape += f",past_{i}:1x{c['num_key_value_heads']}x{keys}x{c['head_dim']}"
-                return shape
 
-            options, providers = session_options(
-                self.provider,
-                threads,
-                {
-                    "nv_profile_min_shapes": shapes(1, 4 if self.metadata.get("dynamic_cache_capacity") else capacity),
-                    "nv_profile_opt_shapes": shapes(
-                        min(128, capacity),
-                        min(2048, capacity) if self.metadata.get("dynamic_cache_capacity") else capacity,
-                    ),
-                    "nv_profile_max_shapes": shapes(capacity, capacity),
-                },
-            )
-        self.decoder = ort.InferenceSession(str(directory / self.text_graph), options, providers=providers)
-
-    def session(self, name):
-        options, providers = session_options(self.provider, self.threads)
-        return ort.InferenceSession(str(self.directory / name), options, providers=providers)
+            sessions = []
+            for sequence in (1, self.metadata["prefill_block"]):
+                options, providers = session_options(
+                    self.provider,
+                    threads,
+                    {f"nv_profile_{bound}_shapes": shapes(sequence) for bound in ("min", "opt", "max")},
+                )
+                sessions.append(ort.InferenceSession(str(directory / self.text_graph), options, providers=providers))
+            self.decoder, self.prefill = sessions
+        else:
+            options, providers = session_options(self.provider, threads)
+            self.decoder = ort.InferenceSession(str(directory / self.text_graph), options, providers=providers)
 
     def run(self, session, feed, inplace=False):
         values = {}
@@ -151,10 +145,25 @@ class OnnxAudioModel:
         return [torch.from_dlpack(value).cpu().clone() for value in outputs]
 
     def encode(self, inputs):
-        packed = pack_audio(inputs["input_features"], inputs["input_features_mask"], self.metadata["audio_config"])
-        return self.run(
-            self.encoder, dict(zip(("mel_chunks", "valid_indices", "attention_bias"), packed, strict=True))
-        )[0]
+        config = self.metadata["audio_config"]
+        window = config["n_window_infer"]
+        features, mask = inputs["input_features"], inputs["input_features_mask"]
+        outputs = []
+        for start in range(0, int(mask.sum()), window):
+            chunks, indices, _ = pack_audio(
+                features[..., start : start + window], mask[..., start : start + window], config
+            )
+            tokens = window // 100 * 13
+            bias = torch.zeros(1, 1, tokens, tokens)
+            bias[..., len(indices) :] = -1e4
+            packed = torch.zeros(window // 100, 128, 100)
+            packed[: len(chunks)] = chunks
+            outputs.append(
+                self.run(
+                    self.encoder, {"mel_chunks": packed, "valid_indices": torch.arange(tokens), "attention_bias": bias}
+                )[0][: len(indices)]
+            )
+        return torch.cat(outputs)
 
     def empty_cache(self, capacity):
         c = self.metadata["text_config"]
@@ -163,22 +172,32 @@ class OnnxAudioModel:
             for _ in range(2 * c["num_hidden_layers"])
         ]
 
-    def step(self, ids, embeddings, cache, length, session=None):
-        feed = decoder_inputs(
-            ids,
-            embeddings,
-            self.metadata["audio_token_id"],
-            self.metadata["text_config"]["hidden_size"],
-            length,
-            cache[0].shape[2],
-        )
-        feed.update({f"past_{i}": value for i, value in enumerate(cache)})
-        logits, _, *present = self.run(
-            session or self.decoder,
-            feed,
-            inplace=session is not None and session is not self.decoder and self.provider == "trt-rtx",
-        )
-        return logits, present
+    def step(self, ids, embeddings, cache, length):
+        ids = ids.reshape(1, -1)
+        block = self.metadata["prefill_block"] if ids.numel() > 1 else 1
+        audio_offset = 0
+        for offset in range(0, ids.numel(), block):
+            chunk = ids[:, offset : offset + block]
+            valid = chunk.numel()
+            padded = torch.zeros(1, block, dtype=torch.int64)
+            padded[:, :valid] = chunk
+            count = int((chunk == self.metadata["audio_token_id"]).sum())
+            audio = embeddings[audio_offset : audio_offset + count] if embeddings is not None else None
+            audio_offset += count
+            feed = decoder_inputs(
+                padded,
+                audio,
+                self.metadata["audio_token_id"],
+                self.metadata["text_config"]["hidden_size"],
+                length + offset,
+                cache[0].shape[2],
+            )
+            feed["logits_index"] = torch.tensor([valid - 1])
+            feed.update({f"past_{i}": value for i, value in enumerate(cache)})
+            logits, _, *cache = self.run(
+                self.prefill if block > 1 else self.decoder, feed, inplace=self.provider == "trt-rtx"
+            )
+        return logits, cache
 
 
 def compare(actual, expected, atol):
@@ -196,15 +215,13 @@ def compare_cache(actual, expected, length, atol):
     return {"passed": all(c["passed"] for c in checks), "max_abs_error": max(c["max_abs_error"] for c in checks)}
 
 
-def generate_onnx(reference, runner, inputs, embeddings, capacity, session, max_new_tokens):
+def generate_onnx(reference, runner, inputs, embeddings, capacity, max_new_tokens):
     cache, length = runner.empty_cache(capacity), 0
 
     def forward(input_ids, input_features=None, input_features_mask=None, attention_mask=None, **kwargs):
         nonlocal cache, length
         ids = input_ids[:, length:]
-        logits, cache = runner.step(
-            ids, embeddings if length == 0 else None, cache, length, session if length else None
-        )
+        logits, cache = runner.step(ids, embeddings if length == 0 else None, cache, length)
         length += ids.shape[1]
         return CausalLMOutputWithPast(logits=logits[:, None].to(input_ids.device))
 
@@ -218,15 +235,8 @@ def validate_asr(args, runner, reference, inputs, ref_inputs):
     required = length + args.max_new_tokens
     metadata = runner.metadata
     capacity = metadata["cache_capacity"]
-    if metadata.get("dynamic_cache_capacity"):
-        capacity = min(capacity, max(4, 1 << (required - 1).bit_length()))
     if required > capacity:
         raise ValueError("Prompt and generation budget exceed exported cache capacity")
-    specialized = metadata.get("decode_capacities", [])
-    bucket = next((c for c in sorted(specialized) if capacity <= c <= metadata["cache_capacity"]), None)
-    if bucket is not None and metadata.get("dynamic_cache_capacity"):
-        capacity = bucket
-    session = runner.session(f"decode_{capacity}.onnx") if capacity in specialized else None
     audio = runner.encode(inputs)
     expected_audio = reference.get_audio_features(
         ref_inputs["input_features"], ref_inputs["input_features_mask"]
@@ -240,12 +250,11 @@ def validate_asr(args, runner, reference, inputs, ref_inputs):
     }
     token = expected.logits[:, -1].argmax(-1, keepdim=True)
     next_expected = reference(input_ids=token, past_key_values=expected.past_key_values, use_cache=True)
-    for name, decoder in [("cached", runner.decoder)] + ([("specialized", session)] if session else []):
-        next_logits, present = runner.step(token, None, cache, length, decoder)
-        checks[f"{name}_logits"] = compare(next_logits, next_expected.logits[:, -1], args.atol)
-        checks[f"{name}_kv"] = compare_cache(present, next_expected.past_key_values, length + 1, args.atol)
+    next_logits, present = runner.step(token, None, cache, length)
+    checks["cached_logits"] = compare(next_logits, next_expected.logits[:, -1], args.atol)
+    checks["cached_kv"] = compare_cache(present, next_expected.past_key_values, length + 1, args.atol)
     expected_ids = reference.generate(**ref_inputs, do_sample=False, max_new_tokens=args.max_new_tokens)
-    actual_ids = generate_onnx(reference, runner, ref_inputs, audio, capacity, session, args.max_new_tokens)
+    actual_ids = generate_onnx(reference, runner, ref_inputs, audio, capacity, args.max_new_tokens)
     expected_tokens, actual_tokens = expected_ids[0, length:].tolist(), actual_ids[0, length:].tolist()
     eos = metadata["eos_token_ids"]
     exact = expected_tokens == actual_tokens

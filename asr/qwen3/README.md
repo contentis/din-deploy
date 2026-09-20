@@ -54,12 +54,12 @@ python -X utf8 export_qwen3_asr.py --dtype fp32 --output D:/models/qwen3-asr-0.6
 For FP8 W8A8 decoder projections, supply representative calibration audio:
 
 ```bash
-python -X utf8 export_qwen3_asr.py --quantization fp8 --calibration-audio speech-en.wav speech-zh.wav --decode-capacities 256 512 1024 2048 4096 8192 --output D:/models/qwen3-asr-0.6b-onnx-fp8
+python -X utf8 export_qwen3_asr.py --quantization fp8 --calibration-audio speech-en.wav speech-zh.wav --output D:/models/qwen3-asr-0.6b-onnx-fp8
 ```
 
 Add `--size 1.7B` for the larger model. Only decoder projections use FP8; other
 components stay BF16. Use a compatible GPU and check transcription accuracy.
-`--only decode --quantization fp8` reuses calibration for new cache buckets.
+`--only decoder --quantization fp8` reuses saved calibration.
 
 The C++ pipeline reads precision from each export; ASR and aligner can use different
 precisions. FP32 uses decomposed attention for TensorRT RTX compatibility; BF16/FP16
@@ -69,10 +69,18 @@ HF downloads checkpoints automatically. Use `--model` for a local checkpoint or
 `--revision` to pin the source. Keep each export directory intact. Log-mel
 processing reuses the shared Whisper frontend.
 
-For faster cached decoding, add `--decode-capacities 1024 2048 4096 8192` to the
-ASR export command. These graphs use standard ONNX operations, including TensorScatter;
-there are no contrib ops. KV updates are in-place only on this specialized path.
-The general decoder uses separate cache banks. Attention scans allocated capacity.
+Exports contain one encoder and one decoder, each with one weight file, plus the
+shared log-mel graph. Prefill and token generation update one KV bank in place.
+The decoder uses two fixed TensorRT profiles (512-token prefill and one-token
+steps), compiled once and cached; audio length does not create more encoder/decoder
+profiles. The two engines may each retain weights in GPU memory. Changed exports
+get new cache keys; clear compiled caches when changing the GPU or runtime.
+
+`--cache-capacity` sets the token ceiling (default 8192; multiples of 512 up to
+16384). Long audio uses upstream quiet-boundary splitting with enough room reserved
+for `--max-new-tokens`. Reaching that generation limit returns `reached_eos=false`.
+Attention still scans the allocated cache. BF16/FP16 KV uses 896 MiB at 8192 slots;
+FP8 weights do not quantize KV. Re-export older ASR artifacts for format 3.
 
 ## Verify
 
@@ -118,5 +126,6 @@ Standalone alignment accepts segments up to 180 seconds; longer recordings need
 matching audio/text segments. ASR splits long audio using upstream's quiet-boundary
 algorithm: 1200-second targets, or 180 with alignment, and a ±5-second search.
 `--max-chunk-seconds` overrides the target (6–1200, or 6–180 with alignment);
-zero uses the defaults. This is a target, not a strict duration cap.
+zero uses the defaults. The KV budget limits this target further. This is a target,
+not a strict duration cap.
 Increase `--max-new-tokens` from 512 for longer speech.
