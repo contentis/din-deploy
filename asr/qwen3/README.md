@@ -1,14 +1,14 @@
 # Qwen3 ASR and forced alignment
 
-Offline C++ inference with TensorRT RTX in BF16 (default), FP16 or FP32, with optional FP8 decoder quantization.
+Offline C++ inference with CPU or TensorRT RTX. Use FP32 exports for CPU; TensorRT RTX supports BF16 (default), FP16 and FP32.
 
 ## Supported models
 
-| Model | Hugging Face ID | Checkpoint | BF16 export | FP16 export | FP32 export | FP8 decoder | Recommended export |
-| --- | --- | --- | --- | --- | --- | --- | --- |
-| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | ✓ | BF16 |
-| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | ✓ | ✓ | ✓ | BF16 |
-| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | — | BF16 |
+| Model | Hugging Face ID | Checkpoint | BF16 export | FP16 export | FP32 export | Recommended export |
+| --- | --- | --- | --- | --- | --- | --- |
+| ASR 0.6B | `Qwen/Qwen3-ASR-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
+| ASR 1.7B | `Qwen/Qwen3-ASR-1.7B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
+| Forced Aligner 0.6B | `Qwen/Qwen3-ForcedAligner-0.6B-hf` | BF16 | ✓ | ✓ | ✓ | BF16 |
 
 ## Supported capabilities
 
@@ -55,16 +55,6 @@ python -X utf8 export_qwen3_asr.py --dtype fp16 --output D:/models/qwen3-asr-0.6
 python -X utf8 export_qwen3_asr.py --dtype fp32 --output D:/models/qwen3-asr-0.6b-onnx-fp32
 ```
 
-For FP8 W8A8 decoder projections, supply representative calibration audio:
-
-```bash
-python -X utf8 export_qwen3_asr.py --quantization fp8 --calibration-audio speech-en.wav speech-zh.wav --output D:/models/qwen3-asr-0.6b-onnx-fp8
-```
-
-Add `--size 1.7B` for the larger model. Only decoder projections use FP8; other
-components stay BF16. Use a compatible GPU and check transcription accuracy.
-`--only decoder --quantization fp8` reuses saved calibration.
-
 The C++ pipeline reads precision from each export; ASR and aligner can use different
 precisions. FP32 uses decomposed attention for TensorRT RTX compatibility; BF16/FP16
 use fused attention. Log-mel stays FP32. Use separate output directories per precision.
@@ -83,8 +73,8 @@ get new cache keys; clear compiled caches when changing the GPU or runtime.
 `--cache-capacity` sets the token ceiling (default 8192; multiples of 512 up to
 16384). Long audio uses upstream quiet-boundary splitting with enough room reserved
 for `--max-new-tokens`. Reaching that generation limit returns `reached_eos=false`.
-Attention still scans the allocated cache. BF16/FP16 KV uses 896 MiB at 8192 slots;
-FP8 weights do not quantize KV. Re-export older ASR artifacts for format 3.
+Attention still scans the allocated cache. BF16/FP16 KV uses 896 MiB at 8192 slots.
+Re-export older ASR artifacts for format 3.
 
 ## Verify
 
@@ -99,7 +89,6 @@ then uses HF `generate()` for a short end-to-end token/EOS check. Alignment uses
 HF transcript preparation and span decoding. Strict BF16 numerical comparisons
 can fail despite matching tokens/spans. Long-form specialized decoding can change
 words; long-form alignment has small endpoint differences from HF.
-FP8 validation uses the original BF16 HF reference.
 
 ## Build
 
@@ -107,30 +96,40 @@ Build from the repository root with the same TensorRT RTX setup as Whisper.
 An NVIDIA GPU supporting the selected TensorRT RTX precision is required.
 
 ```powershell
-cmake --build out\build\windows-x64 --target din_asr_qwen3_cli
+cmake --build out\build\windows-x64 --target din_asr_qwen3_cli din_asr_qwen3_aligner_cli
 ```
 
 ## Run
 
 ```powershell
 out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --model-dir D:\models\qwen3-asr-1.7b-onnx-bf16
-out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --model-dir D:\models\qwen3-asr-0.6b-onnx-bf16 --aligner-dir D:\models\qwen3-aligner-onnx-bf16
-out\build\windows-x64\bin\din_asr_qwen3_cli.exe audio.mp3 --aligner-dir D:\models\qwen3-aligner-onnx-bf16 --transcript transcript.txt --lang-id zh
+out\build\windows-x64\bin\din_asr_qwen3_aligner_cli.exe audio.mp3 --model-dir D:\models\qwen3-aligner-onnx-bf16 --transcript transcript.txt --lang-id zh
 ```
 
 Multi-configuration builds add the configuration (for example, `Release`) under `bin`.
-`--transcript` loads only the aligner and accepts text from any ASR model or a
-supplied transcript. C++ callers can use `Qwen3ForcedAligner::Align` or `AlignFile`.
+ASR and alignment are independent APIs in the same library:
 
-Reuse pipeline/aligner instances; calls on one instance are synchronous.
-Set `Qwen3Config::progress` for audio loading, model loading/compilation, ASR chunk
-completion and standalone alignment start/completion. Callbacks run on the calling
-thread; inference progress is stage/chunk-based, not a token-level percentage.
-Standalone alignment accepts segments up to 180 seconds; longer recordings need
-matching audio/text segments. ASR splits long audio using upstream's quiet-boundary
-algorithm: 1200-second targets, or 180 with alignment, and a ±5-second search.
-`--max-chunk-seconds` overrides the target (6–1200, or 6–180 with alignment);
-zero uses the defaults. The KV budget limits this target further. This is a target,
-not a strict duration cap.
+| API / CLI | Input | Output |
+|---|---|---|
+| `Qwen3Pipeline` / `din_asr_qwen3_cli` | Audio | Text, tokens, language and audio chunk boundaries |
+| `Qwen3ForcedAligner` / `din_asr_qwen3_aligner_cli` | Audio, supplied text and language | Word/character timestamps |
+
+Include `qwen3.h` for ASR or `forced_aligner.h` for alignment. The aligner loads
+no ASR model; use text from Whisper, Parakeet, Nemotron, Qwen ASR or a text file.
+Both CLIs accept `--provider cpu|trt-rtx`, `--model-dir` and cache options independently.
+Reuse instances; each processes one synchronous call at a time. Both configs expose
+`progress` callbacks for loading, compilation and processing.
+
+`Align` takes mono 16 kHz audio; `AlignFile` decodes it automatically. Alignment
+accepts at most 180 seconds per call. Long recordings require matching audio/text
+segments, with returned timestamps offset by each segment's start.
+
+ASR returns `segments` with text, detected language and half-open `start_sample` /
+`end_sample` offsets at 16 kHz. Its upstream quiet-boundary splitter uses a
+1200-second target and a ±5-second search, further limited by KV capacity.
+`--max-chunk-seconds` overrides the target (6–1200; 0 uses the default).
+For subsequent alignment, use a target of 175 seconds or less to reserve the
+search margin within the 180-second limit. Chunk boundaries are not word timestamps.
+
 `--max-new-tokens` defaults to 1024 per chunk. If `reached_eos` is false, increase
 the budget or reduce `--max-chunk-seconds`; the transcript is incomplete.
